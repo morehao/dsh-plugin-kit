@@ -1,0 +1,93 @@
+# 自动发布（Trusted Publishing / OIDC，tag 触发）：推送 vX.Y.Z 标签时从 tag 读版本，
+# 经 OIDC 发布 @morehao/dsh-plugin-kit，并用注记 tag 的正文建 GitHub Release。
+#
+# 首次发布（0.1.0）仍需手工 `npm publish`：npm 的 trusted publisher 要先有包才能配置。
+# 之后一次性前置：
+#   npm trust github @morehao/dsh-plugin-kit \
+#     --repo morehao/dsh-plugin-kit --file release.yml --allow-publish
+#   - Workflow 必须等于本文件 name（release.yml），与 npm 侧配置精确匹配；
+#   - Allowed actions 必须包含 `npm publish`（2026-09-03 后新建默认只允许 stage publish）。
+#
+# 版本约定：发布版本 = 去掉 tag 前缀 v，必须等于 package.json.version；npm 上已存在则跳过（幂等）。
+name: release.yml
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（如 v0.1.1）'
+        required: true
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write   # OIDC 可信发布
+      contents: write   # 建 GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      # 不设 registry-url：发布凭据一律走 OIDC，免得 .npmrc 里的占位 token 与 OIDC 抢凭据。
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: OIDC 环境自检
+        run: |
+          echo "GITHUB_ACTIONS=${GITHUB_ACTIONS:-unset}"
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "id-token env: present"
+          else
+            echo "id-token env: MISSING（检查 permissions.id-token: write 与仓库策略）"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: 发布前校验（与 PR 门禁同一套）
+        run: npm run check
+
+      - name: Publish to npm via OIDC
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          NPM_CONFIG_LOGLEVEL: verbose
+        run: |
+          version="${RELEASE_TAG#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$version" != "$pkg_version" ]; then
+            echo "tag 版本 $version 与 package.json $pkg_version 不一致"
+            exit 1
+          fi
+          if npm view "@morehao/dsh-plugin-kit@${version}" version >/dev/null 2>&1; then
+            echo "npm 上已有 ${version}；跳过发布（幂等）"
+            exit 0
+          fi
+          npm publish --provenance --access public
+
+      - name: Create GitHub Release from tag annotation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在；跳过（幂等）"
+            exit 0
+          fi
+          git fetch --force --no-recurse-submodules origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-from-tag
