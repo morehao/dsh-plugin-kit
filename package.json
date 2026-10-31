@@ -1,0 +1,69 @@
+{
+  "name": "@morehao/dsh-plugin-kit",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 插件共用工具包：插件自更新引擎（查 npm 最新版 + 经宿主 pluginManager 重装）、headless 客户端控制器与 HTTP 小工具。零 @deepseek-ai 运行时依赖，宿主能力全部注入。",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./update": {
+      "types": "./dist/update.d.ts",
+      "default": "./dist/update.js"
+    },
+    "./update/client": {
+      "types": "./dist/update-client.d.ts",
+      "default": "./dist/update-client.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "default": "./dist/http.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "engines": {
+    "node": "^22.20.0 || >=24.0.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin-update",
+    "self-update"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/*.test.mjs\"",
+    "pretest": "npm run build",
+    "check": "npm run typecheck && npm run build && npm test --ignore-scripts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT",
+  "author": "morehao <morehao@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/morehao/dsh-plugin-kit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/morehao/dsh-plugin-kit/issues"
+  },
+  "homepage": "https://github.com/morehao/dsh-plugin-kit",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
