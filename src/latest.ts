@@ -3,13 +3,21 @@
  *
  * 顺序（可配置）：
  *   1. 调用方注入的 `runPnpmView`（让插件用自己 profile 的包管理器查，继承 .npmrc 的
- *      镜像 / 私源 / token；宿主内裸 fetch 读不到这些配置）；
- *   2. 宿主 `pluginManager.registries()` 给出的 registry 计划，依次问 `<base><pkg>/latest`；
+ *      镜像 / 私源 / token；宿主内裸 fetch 读不到这些配置）。**这是复用宿主包管理器**：
+ *      查询在 profile 目录、profile 的 packageManager 环境下执行，与宿主安装同源。
+ *   2. 宿主 `pluginManager.registries()` 给出的 registry 列表，依次问 `<base><pkg>/latest`；
+ *      排序**优先用调用方注入的宿主原生 `registryPlan`**（与安装完全一致），未注入则内置兜底
+ *      （见 `registry.ts` 的 `resolveRegistryPlan`）；
  *   3. 都没有就用官方 registry。
  *
- * 全部失败返回 null（不抛）：调用方用它标记 `checkFailed`，界面照常可用。
+ * **为什么不用宿主的 `pluginManager.inspect()` 查最新版**：`inspect()` 在 registry 分支会先判
+ * 「该包是否已在 profile 依赖中」，命中即返回 `already-installed`，不会真正去问 registry。
+ * 插件自更新要查的正是「我自己这个已装包」，必然命中该拦截，所以此处只能走 `pnpm view` / `/latest`。
+ *
+ * 全部失败返回 null（不抛）：调用方用它标记 `checkFailed`，界面照常可用。注意「查不到」≠「宿主缺失」，
+ * 而是网络 / registry / 包管理器任一环节不可用时的运行时降级。
  */
-import { DEFAULT_CACHE_TTL_MS, DEFAULT_TIMEOUT_MS, encodePackageName, registryPlan } from './registry.js';
+import { DEFAULT_CACHE_TTL_MS, DEFAULT_TIMEOUT_MS, encodePackageName, resolveRegistryPlan, type HostRegistryPlan } from './registry.js';
 import { parseSemver } from './semver.js';
 
 export type Logger = (event: string, detail?: Record<string, unknown>) => void;
@@ -26,6 +34,12 @@ export interface LatestDeps {
   fetchImpl?: typeof fetch;
   /** 可选：用 profile 的包管理器查 `pkg@latest`，返回版本号或 null。 */
   runPnpmView?: (spec: string) => Promise<string | null>;
+  /**
+   * 可选：注入宿主原生 `registryPlan`（`@deepseek-ai/dsh-plugin-manager/registry` 导出的那个），
+   * 让「查 latest 的 registry 顺序」与宿主安装完全一致（含私有源只问自己的语义）。不注入则用
+   * 内置兜底顺序。各插件自己 import 后传进来，保持本包零 `@deepseek-ai/*` 运行时依赖。
+   */
+  registryPlan?: HostRegistryPlan;
   timeoutMs?: number;
   cacheTtlMs?: number;
   now?: () => number;
@@ -87,7 +101,7 @@ export function createLatestResolver(deps: LatestDeps): LatestResolver {
   }
 
   async function viaRegistries(): Promise<{ version: string; source: string } | null> {
-    const plan = registryPlan(await readRegistries());
+    const plan = resolveRegistryPlan(await readRegistries(), deps.registryPlan);
     for (const base of plan) {
       try {
         const response = await fetchImpl(`${base}${encodePackageName(deps.meta.name)}/latest`, {
