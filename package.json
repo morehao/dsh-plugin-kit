@@ -1,6 +1,6 @@
 {
   "name": "@morehao/dsh-plugin-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 插件共用工具包：插件自更新引擎（查 npm 最新版 + 经宿主 pluginManager 重装）、headless 客户端控制器与 HTTP 小工具。零 @deepseek-ai 运行时依赖，宿主能力全部注入。",
   "type": "module",
   "main": "dist/index.js",
