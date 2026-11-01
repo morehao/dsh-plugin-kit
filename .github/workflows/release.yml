@@ -1,24 +1,36 @@
-# 自动发布（Trusted Publishing / OIDC，tag 触发）：推送 vX.Y.Z 标签时从 tag 读版本，
-# 经 OIDC 发布 @morehao/dsh-plugin-kit，并用注记 tag 的正文建 GitHub Release。
+# 自动发布（Trusted Publishing / OIDC，tag 触发）：
+#   推送 vX.Y.Z 标签时，从 tag 读版本，经 OIDC 把 @morehao/dsh-plugin-kit 发布到 npmjs。
+#   认证走 OIDC，**不需要 NPM_TOKEN**（job 提 id-token: write，npm CLI 自动换取短时令牌）。
 #
-# 首次发布（0.1.0）仍需手工 `npm publish`：npm 的 trusted publisher 要先有包才能配置。
-# 之后一次性前置：
-#   npm trust github @morehao/dsh-plugin-kit \
-#     --repo morehao/dsh-plugin-kit --file release.yml --allow-publish
-#   - Workflow 必须等于本文件 name（release.yml），与 npm 侧配置精确匹配；
-#   - Allowed actions 必须包含 `npm publish`（2026-09-03 后新建默认只允许 stage publish）。
+#   首次发布（0.1.0）仍需手工 `npm publish`：npm 的 trusted publisher 要先有包才能配置。
+#   之后一次性前置：
+#     npm trust github @morehao/dsh-plugin-kit \
+#       --repo morehao/dsh-plugin-kit --file release.yml --allow-publish
+#     - Workflow 必须等于 release.yml（本文件 name 也必须是 release.yml，OIDC 的 workflow claim
+#       要与 npm 侧精确匹配）；
+#     - Allowed actions 必须允许 `npm publish`（2026-09-03 后新建的默认只允许 stage publish，
+#       会导致 OIDC 直接发布被拒为 permission denied）。
 #
-# 版本约定：发布版本 = 去掉 tag 前缀 v，必须等于 package.json.version；npm 上已存在则跳过（幂等）。
+# 版本约定：发布版本 = 去掉 tag 前缀 v，且必须等于 package.json.version（scripts/ci-publish.sh 会校验）。
+# npm 上同版本已存在则跳过（幂等）。
+#
+# GitHub Release：npm 发布**成功后**，用注记 tag 的正文建 Release（正文由 scripts/release-notes.mjs
+# 从注记原样投影，不重新生成、不改写；已存在则跳过）。
+# `gh release create` 必须留在这个文件里 —— git-kit 的 /git-release 预检靠 grep
+# .github/workflows 判定 EFFECT_RELEASE=workflow，判定为 workflow 后它只校验、不重复建。
+#
+# 本文件与同目录其它插件（dsh-commands / dsh-github-trending / dsh-skills-console）的 release.yml
+# 保持同一套结构，`--notes-file` + scripts/release-notes.mjs 是四仓共用写法。
 name: release.yml
-
 on:
   push:
     tags:
       - 'v*'
+  # 手动补发：tag 指向的提交不可改，workflow 本身修好后靠这里重跑同一版本（不新建 tag）。
   workflow_dispatch:
     inputs:
       tag:
-        description: '要发布的 tag（如 v0.1.1）'
+        description: '要发布的 tag（如 v0.2.1）'
         required: true
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
@@ -34,10 +46,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          # push: 用触发的 tag ref；dispatch: 用输入的 tag（同一个 ref 都能 checkout）
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
-      # 不设 registry-url：发布凭据一律走 OIDC，免得 .npmrc 里的占位 token 与 OIDC 抢凭据。
+      # 不设 registry-url：发布凭据一律走 OIDC，registry 由 scripts/ci-publish.sh 显式指定，
+      # 免得 .npmrc 里的占位 token 与 OIDC 抢凭据。
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
@@ -47,6 +61,8 @@ jobs:
       - name: Upgrade npm for trusted publishing
         run: npm install -g npm@latest
 
+      # OIDC 自检：只打布尔值，不打印 token。缺 id-token 权限时 npm 会静默跳过 OIDC，
+      # 最终只报一句误导性的 ENEEDAUTH —— 先把「环境到底有没有」变成可读事实。
       - name: OIDC 环境自检
         run: |
           echo "GITHUB_ACTIONS=${GITHUB_ACTIONS:-unset}"
@@ -63,23 +79,16 @@ jobs:
       - name: 发布前校验（与 PR 门禁同一套）
         run: npm run check
 
+      # 构建不再挂在 check 之后单独做：产物由 package.json 的 `prepack` 在 publish 时构建一次。
       - name: Publish to npm via OIDC
+        run: bash ./scripts/ci-publish.sh
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          # verbose 才看得到 oidc 的具体失败原因（npm 对 OIDC 失败一律静默、最后只报 ENEEDAUTH）
           NPM_CONFIG_LOGLEVEL: verbose
-        run: |
-          version="${RELEASE_TAG#v}"
-          pkg_version="$(node -p "require('./package.json').version")"
-          if [ "$version" != "$pkg_version" ]; then
-            echo "tag 版本 $version 与 package.json $pkg_version 不一致"
-            exit 1
-          fi
-          if npm view "@morehao/dsh-plugin-kit@${version}" version >/dev/null 2>&1; then
-            echo "npm 上已有 ${version}；跳过发布（幂等）"
-            exit 0
-          fi
-          npm publish --provenance --access public
 
+      # 只在 npm 发布成功后运行（前面失败即中断）。正文来自注记 tag，已存在即跳过，
+      # 因此本步骤可在任意时刻重跑（publish 幂等跳过 + 这里补建缺失的 Release）。
       - name: Create GitHub Release from tag annotation
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,7 +98,15 @@ jobs:
             echo "Release ${TAG} 已存在；跳过（幂等）"
             exit 0
           fi
+          # checkout 对 tag 事件会把本地 ref 重指成轻量 tag，注记对象随之丢失：显式回拉一次。
           git fetch --force --no-recurse-submodules origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-          # 注意：--notes-from-tag 不能与 --repo 同时使用（gh 会报错）。
-          # 该步骤在仓库检出目录内运行，gh 会自动从本地 git remote 推断仓库，故此处省略 --repo。
-          gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag
+          notes="$(mktemp)"
+          node scripts/release-notes.mjs "$TAG" > "$notes"
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file "$notes")
+          # semver 预发布（v1.2.3-beta.1）标记为 prerelease，不抢占 latest
+          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,url,body --jq '{tag:.tagName,url:.url,body_len:(.body|length)}'

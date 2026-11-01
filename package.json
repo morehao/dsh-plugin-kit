@@ -45,7 +45,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.mjs\"",
     "pretest": "npm run build",
-    "check": "npm run typecheck && npm run build && npm test --ignore-scripts"
+    "check": "npm run typecheck && npm run build && npm test --ignore-scripts",
+    "check:release-notes": "node scripts/smoke-release-notes.mjs",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
