@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.3.1] - 2026-11-01
+
+### Features
+
+- 补齐 P1（./github / ./meta / ./http dispatcher）并升 0.4.0 (#8)
+
+**Full Changelog**: https://github.com/morehao/dsh-plugin-kit/compare/v0.3.0...v0.3.1
+
 ## [v0.3.0] - 2026-11-01
 
 ### Features
