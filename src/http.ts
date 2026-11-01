@@ -72,3 +72,85 @@ export async function readJsonBody(
   }
   return value as Record<string, unknown>;
 }
+
+// ── 薄路由 dispatcher ────────────────────────────────────────────────
+//
+// 只做「鉴权 → 剥前缀 → 读 body → 调业务 → 包 {ok:true} → 错误兜底」这层样板，
+// **不做**路由表 DSL / 参数解析 / 错误码翻译：各插件的 matchRoute 与错误码体系差异大，
+// 保留在 `dispatch` 与 `onError` 里（能复用就复用，业务别硬塞）。
+
+export interface RouteContext {
+  request: RequestLike & AsyncIterable<Uint8Array | string>;
+  url: URL;
+  /** 大写方法名。 */
+  method: string;
+  /** 已剥掉 prefix 的 pathname（`/state` 之类）。 */
+  pathname: string;
+  /** 已解析的 JSON body（超出上限/非法会先抛 HttpError）；无 body 时空对象。 */
+  body: Record<string, unknown>;
+}
+
+/** 把插件自己的错误（IpcError / ServiceError …）映射成 HTTP 响应；返回 undefined 走默认 500。 */
+export type RouteErrorMapper = (
+  error: unknown,
+) => { status: number; code?: string; message: string; extra?: Record<string, unknown> } | undefined;
+
+export interface CreateRouteHandlerOptions {
+  /** 路由前缀，如 `/api/morehao/xxx`。 */
+  prefix: string;
+  /** 鉴权头名；要求值 `1`（跨源预检顺带挡 CSRF）。 */
+  header: string;
+  /** 业务 dispatch：返回结果对象（包成 `{ok:true,...}`）或自行写完响应（返回 void）。 */
+  dispatch: (ctx: RouteContext) => Promise<Record<string, unknown> | void>;
+  /** body 上限；默认 512 KiB。 */
+  maxBodyBytes?: number;
+  /** 错误映射；缺省 500 INTERNAL。 */
+  onError?: RouteErrorMapper;
+  logger?: (event: string, data?: Record<string, unknown>) => void;
+}
+
+export type RouteHandler = (request: unknown, response: unknown) => Promise<void>;
+
+/** 造一个宿主的 request 处理器：统一鉴权 / body / 响应 / 错误兜底。 */
+export function createRouteHandler(options: CreateRouteHandlerOptions): RouteHandler {
+  const maxBodyBytes = options.maxBodyBytes ?? 512 * 1024;
+  const logger = options.logger ?? (() => {});
+  const prefix = options.prefix;
+
+  return async (rawRequest: unknown, rawResponse: unknown): Promise<void> => {
+    const request = rawRequest as RequestLike & AsyncIterable<Uint8Array | string> & { url?: string; method?: string };
+    const response = rawResponse as ResponseLike & { writableEnded?: boolean };
+
+    if (!hasHeader(request, options.header)) {
+      sendJson(response, 403, { ok: false, code: 'FORBIDDEN', message: `缺少 ${options.header}: 1 头` });
+      return;
+    }
+
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    const pathname = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) || '/' : url.pathname;
+    const method = (request.method ?? 'GET').toUpperCase();
+
+    try {
+      const body = method === 'GET' || method === 'HEAD' ? {} : await readJsonBody(request, { maxBytes: maxBodyBytes });
+      const result = await options.dispatch({ request, url, method, pathname, body });
+      if (response.writableEnded !== true) {
+        sendJson(response, 200, result === undefined ? { ok: true } : { ok: true, ...result });
+      }
+    } catch (error) {
+      if (response.writableEnded === true) return;
+      const mapped = options.onError?.(error);
+      if (mapped !== undefined) {
+        sendJson(response, mapped.status, {
+          ok: false,
+          ...(mapped.code === undefined ? {} : { code: mapped.code }),
+          message: mapped.message,
+          ...(mapped.extra === undefined ? {} : mapped.extra),
+        });
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      logger('route.error', { method, pathname, message });
+      sendJson(response, 500, { ok: false, code: 'INTERNAL', message });
+    }
+  };
+}

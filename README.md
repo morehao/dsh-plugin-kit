@@ -4,10 +4,12 @@ DeepSeek Harness（dsh）插件共用的工具包。当前提供这些能力：
 
 - **插件自更新引擎**（`./update`）：查 npm 最新版 → 判断能不能一键更新 → 经宿主 `pluginManager` 重装自己。
 - **headless 客户端控制器**（`./update/client`）：检查/更新的状态机与单飞，UI 由各插件自己渲染。
-- **HTTP 小工具**（`./http`）：自定义头鉴权、`no-store` JSON、有上限的 JSON body。
+- **HTTP 小工具**（`./http`）：自定义头鉴权、`no-store` JSON、有上限的 JSON body，以及薄路由 dispatcher（`createRouteHandler`）。
 - **子进程执行**（`./exec`）：argv 直传（不经 shell）、环境白名单、超时/取消、输出上限，外加 `pnpm view` 版本解析。
 - **原子写**（`./fs`）：`writeFileAtomicSync` / `writeFileAtomic`，杜绝「半个文件」。
 - **JSON 状态持久化**（`./state`）：`$DSH_HOME` 解析 + `<home>/<plugin>/*.json` 读写（读 fail-open、写抛错）。
+- **GitHub 工具**（`./github`）：仓库地址规范化 + Release 正文读取（带 TTL 缓存）。
+- **插件身份**（`./meta`）：从自家 `package.json` 读 name / version / repository。
 
 设计约束：**零 `@deepseek-ai/*` 运行时依赖**，宿主能力（`pluginManager` / `profileContext`）全部由调用方注入。进程策略由调用方把握：`./update` 常驻能力不主动 spawn，需要 `pnpm view` 时由调用方注入 `runPnpmView`；也可直接用 `./exec`（或 `createPnpmViewRunner`，默认走 `./exec`、可注入 `exec` 替换进程策略）。
 
@@ -110,11 +112,23 @@ await controller.apply();
 ## HTTP 小工具
 
 ```ts
-import { hasHeader, readJsonBody, sendJson } from '@morehao/dsh-plugin-kit/http';
+import { hasHeader, readJsonBody, sendJson, createRouteHandler } from '@morehao/dsh-plugin-kit/http';
 
 if (!hasHeader(request, 'x-my-plugin')) return sendJson(response, 403, { ok: false, code: 'FORBIDDEN' });
 const body = await readJsonBody(request, { maxBytes: 512 * 1024 });
 sendJson(response, 200, { ok: true });
+
+// 薄路由 dispatcher：统一 鉴权 → 剥前缀 → 读 body → 包 {ok:true} → 错误兜底。
+// 不做路由表 DSL / 错误码翻译——matchRoute 与错误码映射留在你的 dispatch / onError 里。
+const handler = createRouteHandler({
+  prefix: '/api/morehao/my-plugin',
+  header: 'x-dsh-my-plugin',
+  dispatch: async ({ method, pathname, body }) => {
+    if (method === 'GET' && pathname === '/state') return { state: getState() };
+    throw Object.assign(new Error('not found'), { code: 'NOT_FOUND' });
+  },
+  onError: (error) => ({ status: error.code === 'NOT_FOUND' ? 404 : 500, code: error.code, message: error.message }),
+});
 ```
 
 ## 子进程执行（`./exec`）
@@ -181,15 +195,48 @@ const updater = createPluginUpdater({ meta, getPluginManager: () => ctx.get('plu
 
 拿不到 `profile.dir` / 命令失败 / 输出非法 / 版本不是合法 semver → 返回 `null`（交由 registry 兜底）。
 
+## GitHub 工具（`./github`）
+
+仓库地址规范化 + Release 正文读取（收敛各插件重复的正则与拉取逻辑）：
+
+```ts
+import { normalizeRepositoryUrl, repoSlug, createReleaseReader } from '@morehao/dsh-plugin-kit/github';
+
+normalizeRepositoryUrl('git@github.com:o/r.git');   // → 'https://github.com/o/r'
+repoSlug('https://github.com/o/r');                  // → 'o/r'
+
+const reader = createReleaseReader({ repo: 'o/r' }); // ttlMs / failureTtlMs / timeoutMs / fetchImpl 可注入
+const info = await reader.release('1.2.3');          // { version, body, htmlUrl, name } | null
+// 拉 https://api.github.com/repos/o/r/releases/tags/v1.2.3；成功与失败都做 TTL 缓存，失败 → null（不抛）
+```
+
+本模块只依赖 `./semver`，**不 import 任何 node 内置**。
+
+## 插件身份（`./meta`）
+
+从自家 `package.json` 读出 name / version / repository（收敛三仓的 `PLUGIN_META` / `readPluginInfo`）：
+
+```ts
+import { createPluginMeta, readInstalledVersion } from '@morehao/dsh-plugin-kit/meta';
+
+const pkgUrl = new URL('../package.json', import.meta.url); // 层级由插件自己给
+const meta = createPluginMeta({ pkgUrl, defaultName: '@you/plugin' });
+// { name, version, repository?: 'https://github.com/o/r', repo: 'o/r' | null }
+
+readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新值）；失败 → ''
+```
+
+只在 host 侧使用（含 `node:fs`），不被 `./update/client` 引用。
+
 ## 版本与兼容
 
 - Node `^22.20.0 || >=24.0.0`，纯 ESM。
-- `./update`、`./http`、`./exec`、`./fs`、`./state` 走 host 侧；`./update/client` 只含状态机，不 import node 内置模块（客户端产物只允许 react）。
+- `./update`、`./http`、`./exec`、`./fs`、`./state`、`./github`、`./meta` 走 host 侧；`./update/client` 只含状态机，不 import node 内置模块（客户端产物只允许 react）。
 - 宿主服务形状按结构化类型处理（`PluginManagerLike` / `ProfileLike`），宿主版本变化不会把插件一起拖下去。
 
 ## 开发
 
 ```bash
 npm install
-npm run check   # typecheck + build + 49 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
+npm run check   # typecheck + build + 67 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
 ```
