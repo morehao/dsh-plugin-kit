@@ -90,4 +90,6 @@ jobs:
             exit 0
           fi
           git fetch --force --no-recurse-submodules origin "+refs/tags/${TAG}:refs/tags/${TAG}"
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-from-tag
+          # 注意：--notes-from-tag 不能与 --repo 同时使用（gh 会报错）。
+          # 该步骤在仓库检出目录内运行，gh 会自动从本地 git remote 推断仓库，故此处省略 --repo。
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag
