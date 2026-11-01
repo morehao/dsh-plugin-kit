@@ -14,6 +14,8 @@ export {
   manualCommand,
   normalizeRegistry,
   registryPlan,
+  resolveRegistryPlan,
+  type HostRegistryPlan,
   type RegistriesLike,
 } from './registry.js';
 export {

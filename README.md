@@ -14,16 +14,34 @@ DeepSeek Harness（dsh）插件共用的工具包。当前提供三件事：
 npm install @morehao/dsh-plugin-kit
 ```
 
+## 能力边界：哪些复用宿主、哪些必须自建
+
+自更新这件事在宿主（`@deepseek-ai/dsh-plugin-manager`）里已有大半能力，本包的原则是**能复用就复用**：
+
+| 能力 | 来源 | 说明 |
+|---|---|---|
+| 安装 / 卸载 | **复用宿主** | apply 全程走 `pluginManager.installBundle` / `removeBundle`；`already-installed → remove → install` 就是宿主既定的更新流程，`applied/restart-required/overridden` 也直接来自宿主结果。 |
+| registry 列表（镜像 / 私源 / token） | **复用宿主** | `resolved` 由宿主跑 `pnpm config get registry` 解析，本包不自己读 `.npmrc`。 |
+| registry **排序 / 回退** | **复用宿主（注入）** | 优先用调用方注入的宿主原生 `registryPlan`（`@deepseek-ai/dsh-plugin-manager/registry`），与 `installBundle`/`inspect` 内部同一份源码、含私有源「只问它自己、不回退公有源」语义。本包不直接 import（保持零 `@deepseek-ai/*` 运行时依赖），由插件侧注入。未注入时用内置 `resolveRegistryPlan` 兜底（`resolved → registry → fallback` 宽松顺序，fail-open）。 |
+| 查最新版 | **必须自建** | 宿主 `inspect()` 对「已装包」直接返回 `already-installed`，不会去问 registry；插件查的正是「我自己这个已装包」，必然被拦截。故只能走 `pnpm view`（`runPnpmView`，复用 profile 的包管理器）或 registry `/latest`。 |
+| 安装形态判定 | **必须自建** | 宿主未暴露「本包以什么 spec 声明」；本包读 `<profile.dir>/package.json` 识别 `link:/file:/workspace:` 以拒绝把开发链接覆盖成 npm 版。 |
+
+一句话：**装/卸、registry 取数与排序都复用宿主（排序原生能力通过注入复用）；查版本、判形态因宿主 API 缺口而自建；不注入原生 `registryPlan` 时才回落到内置兜底顺序。**
+
 ## 一键更新（host）
 
 ```ts
 import { createPluginUpdater } from '@morehao/dsh-plugin-kit/update';
+// 宿主原生 registry 排序（与 installBundle/inspect 同一份），由插件侧注入、本包不直接依赖
+import { registryPlan as hostRegistryPlan } from '@deepseek-ai/dsh-plugin-manager/registry';
 
 const updater = createPluginUpdater({
   meta: { name: pkg.name, version: pkg.version, ...(pkg.repository ? { repository: repoUrl(pkg.repository) } : {}) },
   getPluginManager: () => ctx.get('pluginManager'),
   getProfile: () => ctx.get('profileContext'),
   getProfileName: () => ctx.get('profileContext')?.name,
+  // 可选但推荐：注入宿主原生 registryPlan，使「查版本的 registry 顺序」与宿主安装完全一致
+  registryPlan: hostRegistryPlan,
   // 可选：用 profile 的包管理器查版本（继承 .npmrc 的镜像 / 私源 / token）
   runPnpmView: async (spec) => {
     const profile = ctx.get('profileContext');
@@ -106,5 +124,5 @@ sendJson(response, 200, { ok: true });
 
 ```bash
 npm install
-npm run check   # typecheck + build + 24 条离线测试（假 fetch / 假 pluginManager，不联网、不真装）
+npm run check   # typecheck + build + 26 条离线测试（假 fetch / 假 pluginManager，不联网、不真装）
 ```

@@ -51,6 +51,7 @@ function updater(overrides = {}) {
     readFile: overrides.readFile ?? (async () => profileJson('^0.3.0')),
     fetchImpl,
     ...(overrides.runPnpmView === undefined ? {} : { runPnpmView: overrides.runPnpmView }),
+    ...(overrides.registryPlan === undefined ? {} : { registryPlan: overrides.registryPlan }),
     ...(overrides.now === undefined ? {} : { now: overrides.now }),
     ...(overrides.cacheTtlMs === undefined ? {} : { cacheTtlMs: overrides.cacheTtlMs }),
     logger: (event, detail) => logs.push([event, detail]),
@@ -94,6 +95,23 @@ test('registry 计划优先，失败按回退顺序继续', async () => {
     'https://mirror.example/@demo%2Fplugin/latest',
     'https://fallback.example/@demo%2Fplugin/latest',
   ]);
+});
+
+test('注入宿主原生 registryPlan：查版本的 registry 顺序以它为准', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return { ok: true, status: 200, async json() { return { version: '0.6.0' }; } };
+  };
+  // 宿主的原生 plan 把 custom 源放首位（模拟私有源「只问它自己」），内置兜底则会问 resolved+fallback
+  const hostRegistryPlan = () => ['https://private.example/'];
+  const manager = fakeManager({
+    registries: async () => ({ resolved: 'https://public.example', fallbackRegistries: ['https://fallback.example'] }),
+  });
+  const instance = updater({ manager, fetchImpl, registryPlan: hostRegistryPlan });
+  const view = await instance.check();
+  assert.equal(view.latestVersion, '0.6.0');
+  assert.deepEqual(calls, ['https://private.example/@demo%2Fplugin/latest']);
 });
 
 test('pnpm view 优先生效，命中后不再打 registry', async () => {

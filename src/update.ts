@@ -3,7 +3,11 @@
  *
  * 设计约束（三个 DSH 插件共用这份逻辑）：
  * - **零 `@deepseek-ai/*` 运行时依赖**：pluginManager / profileContext 都由调用方用
- *   `ctx.get(...)` 惰性取，拿不到就退化成「只检查 + 手动命令」。
+ *   `ctx.get(...)` 惰性取。本包定位就是 DSH 插件，宿主必然在；但 `installBundle` 是
+ *   可选/远程能力，取不到只是「当前部署未暴露该能力」，退化成「只检查 + 手动命令」。
+ * - **复用优先**：registry 顺序优先用调用方注入的宿主原生 `registryPlan`（与宿主安装完全一致，
+ *   含私有源语义），未注入则内置兜底（见 `registry.ts` 的 `resolveRegistryPlan`）；查最新版走
+ *   `pnpm view` / registry `/latest`（`inspect()` 对已装包返回 already-installed，不可替代）。
  * - **不自作主张升级**：只有 registry 明确给出合法且严格更新的版本才允许安装；
  *   `link:` / `file:` / `workspace:` 安装一律禁止一键更新（会把开发链接换成 npm 版）。
  * - **装不上要能回退**：宿主 `installBundle` 对已装包会返回 `already-installed`，按官方
@@ -15,11 +19,12 @@
 import { createLatestResolver, type LatestResolver, type Logger, type PluginMeta } from './latest.js';
 import type { InstallKind, ProfileLike } from './profile.js';
 import { detectInstallKind, normalizeProfile } from './profile.js';
-import { manualCommand } from './registry.js';
+import { manualCommand, type HostRegistryPlan } from './registry.js';
 import { isNewerVersion, parseSemver } from './semver.js';
 
 export type { Logger, PluginMeta } from './latest.js';
 export type { InstallKind, ProfileLike } from './profile.js';
+export type { HostRegistryPlan } from './registry.js';
 
 export type UpdateErrorCode =
   | 'NO_MANAGER'
@@ -82,6 +87,8 @@ export interface UpdaterDeps {
   getProfileName?: () => string | null;
   fetchImpl?: typeof fetch;
   runPnpmView?: (spec: string) => Promise<string | null>;
+  /** 可选：注入宿主原生 `registryPlan`（dsh-plugin-manager/registry），让查版本的 registry 顺序与安装一致。 */
+  registryPlan?: HostRegistryPlan;
   readFile?: (path: string) => Promise<string>;
   logger?: Logger;
   now?: () => number;
@@ -139,6 +146,7 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     ...(deps.getPluginManager === undefined ? {} : { getPluginManager: deps.getPluginManager }),
     ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
     ...(deps.runPnpmView === undefined ? {} : { runPnpmView: deps.runPnpmView }),
+    ...(deps.registryPlan === undefined ? {} : { registryPlan: deps.registryPlan }),
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.cacheTtlMs === undefined ? {} : { cacheTtlMs: deps.cacheTtlMs }),
     ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
@@ -248,7 +256,10 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     }
     const service = manager();
     if (service === null || typeof service.installBundle !== 'function') {
-      throw new PluginUpdateError('NO_MANAGER', '当前环境不支持一键更新（缺少 pluginManager.installBundle）', {
+      // 注意：这不是「宿主缺失」——本包定位就是 DSH 插件，宿主必然在。
+      // 而是「当前部署未向本插件暴露 installBundle 能力」（pluginManager 是可选/远程服务），
+      // 或该服务尚未就绪。此时退回手动命令，界面照常可用。
+      throw new PluginUpdateError('NO_MANAGER', '当前 profile 未提供一键安装能力（pluginManager.installBundle 不可用），请手动更新', {
         manualCommand: view.manualCommand,
       });
     }
