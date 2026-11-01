@@ -13,9 +13,12 @@
  * - **装不上要能回退**：宿主 `installBundle` 对已装包会返回 `already-installed`，按官方
  *   更新路径先 remove 再 install；remove 之后 install 失败则尝试装回原版本。
  * - **不重写宿主进程策略**：需要 `pnpm view` 时由调用方注入 `runPnpmView`（进程/环境
- *   白名单是各插件自己的事），本包只做 registry 兜底。
+ *   白名单是各插件自己的事），本包只做 registry 兜底。为免三个插件各抄一遍「读 profile → 拼
+ *   `pnpm view` → 解析 → 校验」，本模块导出 `createPnpmViewRunner` 供直接复用（内部走 `./exec`，
+ *   环境清洗仍由调用方把握；也可注入 `exec` 替换进程策略）。
  * - 更新会把运行中的插件自己卸载，界面会一起消失：全过程落固定事件名，便于事后对账。
  */
+import { type ExecOptions, type ExecResult, collectVersionView, sanitizedEnv, spawnCollect } from './exec.js';
 import { createLatestResolver, type LatestResolver, type Logger, type PluginMeta } from './latest.js';
 import type { InstallKind, ProfileLike } from './profile.js';
 import { detectInstallKind, normalizeProfile } from './profile.js';
@@ -338,5 +341,58 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     latestVersion: (options: { fresh?: boolean } = {}) => resolver.latest(options),
     apply,
     isApplying: () => applying,
+  };
+}
+
+export interface PnpmViewRunnerDeps {
+  /** 取宿主 `profileContext`（提供 `dir` / `packageManager`）；可抛，内部会兜。 */
+  getProfile: () => unknown;
+  /**
+   * 可注入的子进程执行器（默认 `./exec` 的 `spawnCollect`）。
+   * 各插件若要沿用自己更细的进程策略（环境白名单 / 输出上限 / 作业面板旁路），注入即可。
+   */
+  exec?: (command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
+  /** 环境来源；默认 `process.env`，内部过 `sanitizedEnv` 清洗。 */
+  env?: NodeJS.ProcessEnv;
+  /** 单个查询超时毫秒；默认 8_000。 */
+  timeoutMs?: number;
+}
+
+/**
+ * 造一个 `runPnpmView`：用 profile 的包管理器在 profile 目录执行
+ * `pnpm view <spec> version --json`，继承 `.npmrc` 的镜像 / 私源 / token。
+ *
+ * 返回 `(spec) => Promise<string | null>`，与 `UpdaterDeps.runPnpmView` 兼容：
+ * 拿不到 profile.dir / 命令失败 / 输出非法 / 版本不是合法 semver → `null`（交由 registry 兜底）。
+ * 三个插件此前各自手写这段，本工厂与它们的历史行为一致。
+ */
+export function createPnpmViewRunner(deps: PnpmViewRunnerDeps): (spec: string) => Promise<string | null> {
+  const timeoutMs = deps.timeoutMs ?? 8_000;
+  const run = deps.exec ?? spawnCollect;
+  const env = sanitizedEnv(deps.env ?? process.env);
+  return async (spec: string): Promise<string | null> => {
+    let profile: ProfileLike | null;
+    try {
+      profile = normalizeProfile(deps.getProfile());
+    } catch {
+      return null;
+    }
+    if (profile === null || typeof profile.dir !== 'string' || profile.dir === '') return null;
+    const command = profile.packageManager?.command ?? 'pnpm';
+    const prefix = profile.packageManager?.args ?? [];
+    let result: ExecResult;
+    try {
+      result = await run(command, [...prefix, 'view', spec, 'version', '--json'], {
+        cwd: profile.dir,
+        env,
+        timeoutMs,
+        maxStdout: 64 * 1024,
+        maxStderr: 16 * 1024,
+      });
+    } catch {
+      return null;
+    }
+    const version = collectVersionView(result);
+    return version !== null && parseSemver(version) !== undefined ? version : null;
   };
 }

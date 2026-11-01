@@ -1,12 +1,15 @@
 # @morehao/dsh-plugin-kit
 
-DeepSeek Harness（dsh）插件共用的工具包。当前提供三件事：
+DeepSeek Harness（dsh）插件共用的工具包。当前提供这些能力：
 
 - **插件自更新引擎**（`./update`）：查 npm 最新版 → 判断能不能一键更新 → 经宿主 `pluginManager` 重装自己。
 - **headless 客户端控制器**（`./update/client`）：检查/更新的状态机与单飞，UI 由各插件自己渲染。
 - **HTTP 小工具**（`./http`）：自定义头鉴权、`no-store` JSON、有上限的 JSON body。
+- **子进程执行**（`./exec`）：argv 直传（不经 shell）、环境白名单、超时/取消、输出上限，外加 `pnpm view` 版本解析。
+- **原子写**（`./fs`）：`writeFileAtomicSync` / `writeFileAtomic`，杜绝「半个文件」。
+- **JSON 状态持久化**（`./state`）：`$DSH_HOME` 解析 + `<home>/<plugin>/*.json` 读写（读 fail-open、写抛错）。
 
-设计约束：**零 `@deepseek-ai/*` 运行时依赖**，宿主能力（`pluginManager` / `profileContext`）全部由调用方注入；进程相关的策略（比如用哪个包管理器查版本）也由插件自己决定，本包不替你 spawn。
+设计约束：**零 `@deepseek-ai/*` 运行时依赖**，宿主能力（`pluginManager` / `profileContext`）全部由调用方注入。进程策略由调用方把握：`./update` 常驻能力不主动 spawn，需要 `pnpm view` 时由调用方注入 `runPnpmView`；也可直接用 `./exec`（或 `createPnpmViewRunner`，默认走 `./exec`、可注入 `exec` 替换进程策略）。
 
 ## 安装
 
@@ -114,15 +117,79 @@ const body = await readJsonBody(request, { maxBytes: 512 * 1024 });
 sendJson(response, 200, { ok: true });
 ```
 
+## 子进程执行（`./exec`）
+
+argv 直传、不经 shell；超时/取消先 SIGTERM、宽限后 SIGKILL；输出有上限且保留尾部；`spawn` 失败**不 reject**，落到 `error` 字段。
+
+```ts
+import { spawnCollect, sanitizedEnv, collectVersionView } from '@morehao/dsh-plugin-kit/exec';
+
+const result = await spawnCollect('git', ['rev-parse', 'HEAD'], {
+  cwd: repo,
+  env: sanitizedEnv(process.env),      // 只放行 PATH/HOME/代理/证书/locale/git 身份等白名单
+  timeoutMs: 8_000,
+});
+// { code, signal, stdout, stderr, output, timedOut, aborted, durationMs, error? }
+
+// 从 `pnpm view <spec> version --json` 的输出里取版本串（单值或数组取尾；非法 → null）
+const version = collectVersionView({ code: result.code, stdout: result.stdout });
+```
+
+## 原子写（`./fs`）
+
+同目录临时文件 → fsync → rename → fsync(父目录)；Windows rename 有界重试；失败清理临时文件，原文件在 rename 前不被截断。
+
+```ts
+import { writeFileAtomicSync, writeFileAtomic } from '@morehao/dsh-plugin-kit/fs';
+
+writeFileAtomicSync('/path/state.json', `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+await writeFileAtomic('/path/state.json', content);  // 同语义异步版
+```
+
+`mode` 省略时沿用已有文件权限，新文件走 `defaultMode`（默认 `0o644`）。
+
+## JSON 状态持久化（`./state`）
+
+`$DSH_HOME` 解析 + `<home>/<plugin>/*.json` 读写。**读 fail-open**（缺失/坏 JSON/非对象 → `fallback()`，永不抛）；**写抛错**（写通常是一次事务，静默吞掉会掩盖数据丢失，需要「尽力而为」的调用方自行 try/catch）。
+
+```ts
+import { resolveDshHome, createJsonStore } from '@morehao/dsh-plugin-kit/state';
+
+const store = createJsonStore({
+  dir: `${resolveDshHome()}/my-plugin`,   // $DSH_HOME → ~/.dsh
+  file: 'state.json',
+  fallback: () => ({ lastSeenVersion: '' }), // 工厂函数，避免共享可变引用
+});
+const state = store.read();               // 坏文件也返回 fallback
+store.write({ lastSeenVersion: '0.3.0' }); // 原子写
+```
+
+## 复用 `pnpm view` 查版本（`./update`）
+
+三仓此前各手写一遍的「读 profile → 拼 `pnpm view` → 解析 → 校验」，收敛为一个工厂：
+
+```ts
+import { createPnpmViewRunner, createPluginUpdater } from '@morehao/dsh-plugin-kit/update';
+
+const runPnpmView = createPnpmViewRunner({
+  getProfile: () => ctx.get('profileContext'),
+  // 可选：注入自定义 exec 以沿用本插件更细的进程策略；默认走 ./exec
+  // exec: myExecCapture,
+});
+const updater = createPluginUpdater({ meta, getPluginManager: () => ctx.get('pluginManager'), runPnpmView });
+```
+
+拿不到 `profile.dir` / 命令失败 / 输出非法 / 版本不是合法 semver → 返回 `null`（交由 registry 兜底）。
+
 ## 版本与兼容
 
 - Node `^22.20.0 || >=24.0.0`，纯 ESM。
-- `./update` 与 `./http` 走 host 侧；`./update/client` 只含状态机，不 import node 内置模块（客户端产物只允许 react）。
+- `./update`、`./http`、`./exec`、`./fs`、`./state` 走 host 侧；`./update/client` 只含状态机，不 import node 内置模块（客户端产物只允许 react）。
 - 宿主服务形状按结构化类型处理（`PluginManagerLike` / `ProfileLike`），宿主版本变化不会把插件一起拖下去。
 
 ## 开发
 
 ```bash
 npm install
-npm run check   # typecheck + build + 26 条离线测试（假 fetch / 假 pluginManager，不联网、不真装）
+npm run check   # typecheck + build + 49 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
 ```

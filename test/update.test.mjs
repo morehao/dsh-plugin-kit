@@ -229,3 +229,38 @@ test('事件名固定：check / apply.start / apply / apply.failed', async () =>
     'plugin.update.apply.failed',
   ]);
 });
+
+// ── createPnpmViewRunner ──────────────────────────────────────────────
+const { createPnpmViewRunner } = await import('../dist/update.js');
+
+function fakeExec(handler) {
+  const calls = [];
+  const impl = async (command, args, options) => {
+    calls.push({ command, args, options });
+    return handler({ command, args, options });
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+test('pnpmView runner：正常版本串透传', async () => {
+  const exec = fakeExec(() => ({ code: 0, signal: null, stdout: '"1.2.3"\n', stderr: '', output: '', timedOut: false, aborted: false, durationMs: 1 }));
+  const run = createPnpmViewRunner({ getProfile: () => PROFILE, exec, env: { PATH: '/bin' } });
+  assert.equal(await run('@demo/plugin@latest'), '1.2.3');
+  assert.deepEqual(exec.calls[0].args, ['view', '@demo/plugin@latest', 'version', '--json']);
+  assert.equal(exec.calls[0].options.cwd, '/profiles/desktop');
+});
+
+test('pnpmView runner：无 profile.dir / 命令失败 / 非法版本 → null', async () => {
+  const noDir = createPnpmViewRunner({ getProfile: () => ({ name: 'x' }), exec: fakeExec(() => ({ code: 0, stdout: '"1.0.0"' })) });
+  assert.equal(await noDir('@demo/plugin@latest'), null);
+
+  const failing = createPnpmViewRunner({ getProfile: () => PROFILE, exec: fakeExec(() => ({ code: 1, stdout: '' })) });
+  assert.equal(await failing('@demo/plugin@latest'), null);
+
+  const badVersion = createPnpmViewRunner({ getProfile: () => PROFILE, exec: fakeExec(() => ({ code: 0, stdout: '"not-a-version"' })) });
+  assert.equal(await badVersion('@demo/plugin@latest'), null);
+
+  const throwing = createPnpmViewRunner({ getProfile: () => { throw new Error('no ctx'); }, exec: fakeExec(() => ({ code: 0 })) });
+  assert.equal(await throwing('@demo/plugin@latest'), null);
+});
