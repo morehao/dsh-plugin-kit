@@ -9,6 +9,8 @@ export default defineConfig({
     exec: 'src/exec.ts',
     fs: 'src/fs.ts',
     state: 'src/state.ts',
+    github: 'src/github.ts',
+    meta: 'src/meta.ts',
   },
   format: ['esm'],
   target: 'node22',

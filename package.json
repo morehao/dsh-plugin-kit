@@ -1,7 +1,7 @@
 {
   "name": "@morehao/dsh-plugin-kit",
-  "version": "0.3.0",
-  "description": "DeepSeek Harness 插件共用工具包：插件自更新引擎（查 npm 最新版 + 经宿主 pluginManager 重装）、headless 客户端控制器、HTTP 小工具，以及子进程执行 / 原子写 / JSON 状态持久化等通用底座。零 @deepseek-ai 运行时依赖，宿主能力全部注入。",
+  "version": "0.4.0",
+  "description": "DeepSeek Harness 插件共用工具包：插件自更新引擎、headless 客户端控制器、HTTP 小工具与路由 dispatcher、子进程执行、原子写、JSON 状态持久化，以及 GitHub Release 读取与插件身份元数据等通用底座。零 @deepseek-ai 运行时依赖，宿主能力全部注入。",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -33,6 +33,14 @@
     "./state": {
       "types": "./dist/state.d.ts",
       "default": "./dist/state.js"
+    },
+    "./github": {
+      "types": "./dist/github.d.ts",
+      "default": "./dist/github.js"
+    },
+    "./meta": {
+      "types": "./dist/meta.d.ts",
+      "default": "./dist/meta.js"
     },
     "./package.json": "./package.json"
   },
