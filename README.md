@@ -4,6 +4,7 @@ DeepSeek Harness（dsh）插件共用的工具包。当前提供这些能力：
 
 - **插件自更新引擎**（`./update`）：查 npm 最新版 → 判断能不能一键更新 → 经宿主 `pluginManager` 重装自己。
 - **headless 客户端控制器**（`./update/client`）：检查/更新的状态机与单飞，UI 由各插件自己渲染。
+- **跨进程更新记号**（`./update/restore`）：一键更新卸载自身后，新进程读回「刚点过更新」的记号以渲染恢复提示（localStorage + TTL，fail-open；UI 留插件）。
 - **HTTP 小工具**（`./http`）：自定义头鉴权、`no-store` JSON、有上限的 JSON body，以及薄路由 dispatcher（`createRouteHandler`）。
 - **子进程执行**（`./exec`）：argv 直传（不经 shell）、环境白名单、超时/取消、输出上限，外加 `pnpm view` 版本解析。
 - **原子写**（`./fs`）：`writeFileAtomicSync` / `writeFileAtomic`，杜绝「半个文件」。
@@ -108,6 +109,26 @@ await controller.apply();
 
 状态：`idle → checking → available | current | failed`；`available → applying → applied | restart-required | failed`。
 控制器不做 i18n、不引 React：错误码（`CHECK_FAILED` / `NO_UPDATE` / `NO_APPLY` 或宿主抛的 code）交给插件翻译。
+
+## 跨进程更新记号（`./update/restore`，headless）
+
+一键更新会先把插件自己卸载、面板随之消失；新进程重开时要靠一条不随面板消失的「已安装，请完全退出再打开」提示。本子路径只负责把「我刚才点了更新」记进 localStorage 并读回（含 TTL、过期/损坏清理、fail-open），**提示条 UI 由各插件自己渲染**。
+
+```ts
+import { createPendingStore } from '@morehao/dsh-plugin-kit/update/restore';
+
+const pending = createPendingStore({ keyPrefix: 'dsh-skills-console:' }); // 前缀按插件区分
+// 点「确认更新」、动手前：
+pending.write(currentVersion, latestVersion);
+// 新进程重开（读回，过期/损坏自动清理）：
+const notice = pending.read(); // { from, to, at } | null
+// 用户点「知道了」：
+pending.clear();
+```
+
+- 默认 `keyPrefix = 'dsh-plugin-update:'`；设成自家前缀即可复用已有 localStorage 键。
+- `read()` 对过期（默认 24h）、损坏 JSON、结构不符、明显未来时间戳一律返回 `null` 并清理；无 `localStorage` / 隐私模式抛错 → 全程 fail-open，不影响插件挂载。
+- 不依赖 React、不 import node 内置模块，可随客户端产物内联。
 
 ## HTTP 小工具
 
@@ -228,15 +249,41 @@ readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新�
 
 只在 host 侧使用（含 `node:fs`），不被 `./update/client` 引用。
 
+## 能力边界：什么进 kit、什么不进（决策基线）
+
+本包定位是 **DSH 插件共用的横切能力库**，不是插件框架、也不是组件库。判断某个能力该不该进 kit，用下面四条判据，全部满足才进：
+
+1. **≥2 个插件有真实需求**（不是「将来可能」）。当前消费方：`dsh-commands` / `dsh-github-trending` / `dsh-skills-console`。
+2. **与 UI / 主题 / 文案无关**（headless）。凡是承载视觉、样式变量、文案、宿主渲染层的，一律**不进**——各插件用各自的 `h()` 工厂与主题变量自己渲染。
+3. **有明确的复用边界**：是在定义一个通用机制/接口，而不是把某个插件的实现原样搬进来。
+4. **符合本包硬约束**：零 `@deepseek-ai/*` 运行时依赖；host 侧子路径不得被 `./update/client` 引用；进客户端的子模块不 import node 内置模块、不 `require` react。
+
+### 已判定的归属
+
+| 能力 | 判定 | 理由 |
+|---|---|---|
+| 自更新 host 引擎、状态机、registry/semver/超时/缓存、Release 正文读取（host）、插件身份 | **已进** | 三插件共用、headless |
+| 跨进程「刚点过更新」记号 + 恢复提示的**机制**（pending store：读写 + TTL + 按包名 keyPrefix，fail-open） | **已进**（`./update/restore`） | 任何做自更新的插件都会遇到「更新即卸载自身 → 面板消失 → 重开」，与 UI 无关 |
+| 客户端 Release 正文的**纯函数**降级（`<details>` → 加粗小标题）+ 委托取数的薄 loader | **应进** | 纯逻辑 + 注入取数，避免各插件各写一遍 |
+| 直连 GitHub API 的**客户端** reader | **不进** | 与 host `./github` 的 `createReleaseReader` 重复；token/限流是插件自己的事，用注入取数即可 |
+| host 引擎的 `appliedVersion` 收敛（跨版本自更新后不再谎报「有新版本」） | **应进（改 `./update`）** | 引擎级行为，与 UI 无关，任何自更新插件都需要 |
+| 更新**胶囊 / 两段确认 / 详情弹窗**等 UI 组件 | **不进（永不）** | 违反判据 2：各插件 `h()`、样式变量、文案体系不同，强行上提会造兼容多主题的巨型组件 |
+
+### 工程铁律：依赖方向单向、消灭重复
+
+- 依赖只能 `插件 → kit`，**kit 绝不反向依赖任何插件**，插件之间也不互相依赖。
+- 够格进 kit 的能力，**最终形态应是「先在 kit 定义接口 → 各插件消费」**，而不是「先在某个插件里长出来 → 回头再抽出去」（后者会留下多份漂移实现，重复难以根除）。
+- 插件里那份真正的私有逻辑（如 skills-console 的 `layout-selected` 布局卫生）**留在插件**，不因「看起来像更新相关」就上提。
+
 ## 版本与兼容
 
 - Node `^22.20.0 || >=24.0.0`，纯 ESM。
-- `./update`、`./http`、`./exec`、`./fs`、`./state`、`./github`、`./meta` 走 host 侧；`./update/client` 只含状态机，不 import node 内置模块（客户端产物只允许 react）。
+- `./update`、`./http`、`./exec`、`./fs`、`./state`、`./github`、`./meta` 走 host 侧；`./update/client`、`./update/restore` 只含纯逻辑，不 import node 内置模块、不引 React（客户端产物只允许 react）。
 - 宿主服务形状按结构化类型处理（`PluginManagerLike` / `ProfileLike`），宿主版本变化不会把插件一起拖下去。
 
 ## 开发
 
 ```bash
 npm install
-npm run check   # typecheck + build + 67 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
+npm run check   # typecheck + build + 78 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
 ```

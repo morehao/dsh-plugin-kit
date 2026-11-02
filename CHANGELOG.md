@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.4.0] - 2026-11-02
+
+### Features
+
+- 新增 `./update/restore`：headless 跨进程更新记号（pending store）。一键更新卸载自身后，新进程读回「刚点过更新」的记号以渲染恢复提示；支持 TTL、按 `keyPrefix` 区分插件、过期/损坏 fail-open 清理；不 import node 内建、不引 React。UI 仍由各插件自渲染。
+
 ## [v0.3.1] - 2026-11-01
 
 ### Features
