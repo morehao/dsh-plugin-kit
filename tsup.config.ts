@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     update: 'src/update.ts',
     'update-client': 'src/update-client.ts',
+    'update-restore': 'src/update-restore.ts',
     http: 'src/http.ts',
     exec: 'src/exec.ts',
     fs: 'src/fs.ts',
