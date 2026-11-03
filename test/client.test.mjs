@@ -110,3 +110,67 @@ test('订阅、单飞与 reset', async () => {
   assert.equal(controller.getState().status, 'idle');
   assert.equal(seen.at(-1), 'available');
 });
+
+// ---- deriveUpdateUiState / updateStatusLabel（跨插件复用的纯逻辑）----
+const { deriveUpdateUiState, updateStatusLabel } = await import('../dist/update-client.js');
+
+test('deriveUpdateUiState：available → 显示徽标且 actionable', () => {
+  const ui = deriveUpdateUiState({ status: 'available', view: { ...VIEW }, error: null });
+  assert.equal(ui.visual, 'available');
+  assert.equal(ui.busy, false);
+  assert.equal(ui.settled, false);
+  assert.equal(ui.actionable, true);
+  assert.equal(ui.showBadge, true);
+  assert.equal(ui.badgeVersion, '0.4.0');
+});
+
+test('deriveUpdateUiState：available 但不可自动更新 → 不弹确认、不显示徽标', () => {
+  const ui = deriveUpdateUiState({ status: 'available', view: { ...VIEW, canApply: false }, error: null });
+  assert.equal(ui.visual, 'available');
+  assert.equal(ui.actionable, false);
+  assert.equal(ui.showBadge, false);
+  assert.equal(ui.badgeVersion, null);
+});
+
+test('deriveUpdateUiState：current → latest，无徽标', () => {
+  const ui = deriveUpdateUiState({ status: 'current', view: { ...VIEW, updateAvailable: false }, error: null });
+  assert.equal(ui.visual, 'latest');
+  assert.equal(ui.showBadge, false);
+});
+
+test('deriveUpdateUiState：checking / applying → busy（旋转禁用）', () => {
+  assert.equal(deriveUpdateUiState({ status: 'checking', view: null, error: null }).busy, true);
+  assert.equal(deriveUpdateUiState({ status: 'checking', view: null, error: null }).visual, 'checking');
+  assert.equal(deriveUpdateUiState({ status: 'applying', view: { ...VIEW }, error: null }).visual, 'checking');
+});
+
+test('deriveUpdateUiState：restart-required → ok-flash，不弹确认', () => {
+  const ui = deriveUpdateUiState({ status: 'restart-required', view: { ...VIEW }, error: null });
+  assert.equal(ui.visual, 'ok-flash');
+  assert.equal(ui.settled, true);
+  assert.equal(ui.actionable, false);
+});
+
+test('deriveUpdateUiState：failed → error', () => {
+  const ui = deriveUpdateUiState({ status: 'failed', view: { ...VIEW }, error: { code: 'X', message: 'boom' } });
+  assert.equal(ui.visual, 'error');
+});
+
+test('updateStatusLabel：各状态映射到语义 key 与参数', () => {
+  assert.deepEqual(updateStatusLabel({ status: 'checking', view: null, error: null }), { key: 'checking', params: {} });
+  assert.deepEqual(updateStatusLabel({ status: 'applying', view: { ...VIEW }, error: null }), { key: 'applying', params: { version: '0.4.0' } });
+  assert.deepEqual(updateStatusLabel({ status: 'available', view: { ...VIEW }, error: null }), { key: 'available', params: { latest: '0.4.0' } });
+  assert.deepEqual(updateStatusLabel({ status: 'current', view: { ...VIEW, updateAvailable: false }, error: null }), { key: 'latest', params: { version: '0.3.0' } });
+  assert.deepEqual(updateStatusLabel({ status: 'restart-required', view: { ...VIEW }, error: null }), { key: 'done', params: { version: '0.4.0' } });
+});
+
+test('updateStatusLabel：CHECK_FAILED → checkFailed，其他 failed → failed', () => {
+  assert.deepEqual(
+    updateStatusLabel({ status: 'failed', view: { ...VIEW }, error: { code: 'CHECK_FAILED', message: 'x' } }),
+    { key: 'checkFailed', params: {} },
+  );
+  assert.deepEqual(
+    updateStatusLabel({ status: 'failed', view: { ...VIEW }, error: { code: 'NO_APPLY', message: 'x' } }),
+    { key: 'failed', params: {} },
+  );
+});
