@@ -270,6 +270,7 @@ readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新�
 | host 引擎的 `appliedVersion` 收敛（跨版本自更新后不再谎报「有新版本」） | **应进（改 `./update`）** | 引擎级行为，与 UI 无关，任何自更新插件都需要 |
 | 更新**胶囊 / 两段确认 / 详情弹窗**等 UI 组件 | **不进（永不）** | 违反判据 2：各插件 `h()`、样式变量、文案体系不同，强行上提会造兼容多主题的巨型组件 |
 | `apply()` 裸 ctx 守卫的**测试辅助**（`createUndeclaredContext` / `createAbsentContext`） | **已进**（`./test`） | 三插件都要断言「读未声明服务不抛」，共用一份 Proxy；headless、零宿主依赖 |
+| update 结果再包一层 `{ hard, advisory }` / 显式 `severity` 分级 | **不进** | 消费方已用 `PluginUpdateError.code` + `UpdateView.checkFailed` + `deriveUpdateUiState` 完成分流（实测：`dsh-skills-console` 按 `error.code === 'CHECK_FAILED'` 区分「查不到最新版 vs 安装失败」，`dsh-github-trending` 把 `error.code` 作为 `updateCode` 透传前端，`dsh-commands` 透传 `checkFailed`）；再加一层是重复真源且改返回形状属半破坏性。`./github` 更刻意 fail-open 返回 `null`，无需分级 |
 
 ### 工程铁律：依赖方向单向、消灭重复
 
