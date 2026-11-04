@@ -43,7 +43,8 @@ import { createPluginUpdater } from '@morehao/dsh-plugin-kit/update';
 import { registryPlan as hostRegistryPlan } from '@deepseek-ai/dsh-plugin-manager/registry';
 
 const updater = createPluginUpdater({
-  meta: { name: pkg.name, version: pkg.version, ...(pkg.repository ? { repository: repoUrl(pkg.repository) } : {}) },
+  // pkgUrl 让 kit 每次 check 现读磁盘上的「已安装版本」；不传则回退 meta.version（不推荐）
+  meta: { name: pkg.name, version: pkg.version, pkgUrl: new URL('../package.json', import.meta.url), ...(pkg.repository ? { repository: repoUrl(pkg.repository) } : {}) },
   getPluginManager: () => ctx.get('pluginManager'),
   getProfile: () => ctx.get('profileContext'),
   getProfileName: () => ctx.get('profileContext')?.name,
@@ -65,11 +66,25 @@ const updater = createPluginUpdater({
 });
 
 const view = await updater.check({ fresh: true });
-// { packageName, currentVersion, latestVersion, updateAvailable, checkFailed,
-//   canApply, installKind, installSpec?, manualCommand, applying, checkedAt }
+// { packageName, currentVersion, runtimeVersion, latestVersion, updateAvailable,
+//   restartRequired, checkFailed, canApply, installKind, installSpec?, manualCommand, applying, checkedAt }
 
 const result = await updater.apply(); // 需要先 check()；只接受刚查到的版本
 // { application: 'applied' | 'restart-required' | 'overridden', restartRequired, updatedVersion, installKind, steps }
+```
+
+**「当前版本」= 磁盘上已安装的版本（`currentVersion`），这是「是否落后」的唯一真相。**
+`runtimeVersion` 才是本进程启动时加载的代码版本。一键更新把新版写到磁盘后、进程未重启时，
+`currentVersion` 已是新版、`updateAvailable=false`、`restartRequired=true`——不会再谎报「有新版本」，
+`apply()` 也会因磁盘已最新直接 `NO_UPDATE`，杜绝重复卸载重装同一版本。
+
+「已装待重启」的跨进程展示用可选 `stateStore`（`createUpdateStateStore`）持久化 `pendingVersion`：
+
+```ts
+import { createUpdateStateStore } from '@morehao/dsh-plugin-kit/update';
+
+const stateStore = createUpdateStateStore({ dir: join(resolveDshHome(), 'your-plugin') });
+const updater = createPluginUpdater({ /* ... */ stateStore });
 ```
 
 `apply()` 的行为与边界：
@@ -108,7 +123,9 @@ await controller.check();
 await controller.apply();
 ```
 
-状态：`idle → checking → available | current | failed`；`available → applying → applied | restart-required | failed`。
+状态：`idle → checking → available | current | restart-required | failed`；`available → applying → applied | restart-required | failed`。
+`view.restartRequired` 为真时（磁盘已最新、进程仍是旧代码，含重启后新进程），`check()` 直接进 `restart-required`，
+`deriveUpdateUiState` 视作 settled（ok-flash、不催更新）。
 控制器不做 i18n、不引 React：错误码（`CHECK_FAILED` / `NO_UPDATE` / `NO_APPLY` 或宿主抛的 code）交给插件翻译。
 
 ## 跨进程更新记号（`./update/restore`，headless）
@@ -247,6 +264,9 @@ const meta = createPluginMeta({ pkgUrl, defaultName: '@you/plugin' });
 
 readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新值）；失败 → ''
 ```
+
+> `createPluginUpdater` 的 `meta.pkgUrl` 就取自这里的 `pkgUrl`：kit 用它现读磁盘已安装版本，
+> 作为「是否落后」的唯一真相（见上文「一键更新」）。
 
 只在 host 侧使用（含 `node:fs`），不被 `./update/client` 引用。
 

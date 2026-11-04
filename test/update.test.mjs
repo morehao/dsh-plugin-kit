@@ -58,6 +58,8 @@ function updater(overrides = {}) {
     ...(overrides.meta === undefined ? {} : { meta: overrides.meta }),
     ...(overrides.getProfile === undefined ? {} : { getProfile: overrides.getProfile }),
     ...(overrides.getPluginManager === undefined ? {} : { getPluginManager: overrides.getPluginManager }),
+    ...(overrides.readInstalledVersion === undefined ? {} : { readInstalledVersion: overrides.readInstalledVersion }),
+    ...(overrides.stateStore === undefined ? {} : { stateStore: overrides.stateStore }),
   });
 }
 
@@ -228,6 +230,78 @@ test('事件名固定：check / apply.start / apply / apply.failed', async () =>
     'plugin.update.apply.start',
     'plugin.update.apply.failed',
   ]);
+});
+
+// ── 磁盘版本真相链 ────────────────────────────────────────────────────
+
+test('磁盘版本：快照落后但磁盘已最新 → 不报有更新，且 restartRequired 为真', async () => {
+  // 进程加载的是 0.3.0（runtime），但磁盘已经装到 0.4.0（=latest），仅未重启。
+  const instance = updater({
+    readInstalledVersion: () => '0.4.0',
+    fetchImpl: fetchOf({ 'https://registry.npmjs.org/@demo%2Fplugin/latest': '0.4.0' }),
+  });
+  const view = await instance.check();
+  assert.equal(view.currentVersion, '0.4.0'); // 磁盘真身
+  assert.equal(view.runtimeVersion, '0.3.0'); // 进程快照
+  assert.equal(view.updateAvailable, false); // 不再谎报
+  assert.equal(view.restartRequired, true); // 但要重启
+});
+
+test('磁盘版本：磁盘落后 → 有更新、不待重启', async () => {
+  const instance = updater({
+    readInstalledVersion: () => '0.3.0',
+    fetchImpl: fetchOf({ 'https://registry.npmjs.org/@demo%2Fplugin/latest': '0.4.0' }),
+  });
+  const view = await instance.check();
+  assert.equal(view.currentVersion, '0.3.0');
+  assert.equal(view.updateAvailable, true);
+  assert.equal(view.restartRequired, false);
+});
+
+test('磁盘版本：磁盘已最新再点 apply → NO_UPDATE（杜绝重复安装循环）', async () => {
+  let installs = 0;
+  const manager = fakeManager({ install: () => { installs += 1; return { application: 'restart-required' }; } });
+  const instance = updater({
+    manager,
+    readInstalledVersion: () => '0.3.0',
+    fetchImpl: fetchOf({ 'https://registry.npmjs.org/@demo%2Fplugin/latest': '0.4.0' }),
+  });
+  await instance.check();
+  const result = await instance.apply();
+  assert.equal(result.updatedVersion, '0.4.0');
+  assert.equal(installs, 1);
+  // 模拟磁盘已被更新到 0.4.0：再次 check 后 apply 必须 NO_UPDATE
+  const again = updater({
+    manager,
+    readInstalledVersion: () => '0.4.0',
+    fetchImpl: fetchOf({ 'https://registry.npmjs.org/@demo%2Fplugin/latest': '0.4.0' }),
+  });
+  await again.check();
+  await assert.rejects(again.apply(), (error) => error.code === 'NO_UPDATE');
+});
+
+test('磁盘版本：readInstalledVersion 读失败（空串）→ 回退 runtime，不谎报', async () => {
+  const instance = updater({
+    readInstalledVersion: () => '',
+    fetchImpl: fetchOf({ 'https://registry.npmjs.org/@demo%2Fplugin/latest': '0.4.0' }),
+  });
+  const view = await instance.check();
+  assert.equal(view.currentVersion, '0.3.0'); // 回退 meta.version
+  assert.equal(view.updateAvailable, true);
+});
+
+test('apply 成功写 pendingVersion（stateStore）', async () => {
+  const writes = [];
+  const stateStore = {
+    read: () => ({}),
+    recordApplied: (from, to) => writes.push([from, to]),
+    clearPending: () => {},
+  };
+  const manager = fakeManager({ install: () => ({ application: 'restart-required' }) });
+  const instance = updater({ manager, stateStore });
+  await instance.check();
+  await instance.apply();
+  assert.deepEqual(writes, [['0.3.0', '0.4.0']]);
 });
 
 // ── createPnpmViewRunner ──────────────────────────────────────────────
