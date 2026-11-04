@@ -20,14 +20,18 @@
  */
 import { type ExecOptions, type ExecResult, collectVersionView, sanitizedEnv, spawnCollect } from './exec.js';
 import { createLatestResolver, type LatestResolver, type Logger, type PluginMeta } from './latest.js';
+import { readInstalledVersion } from './meta.js';
 import type { InstallKind, ProfileLike } from './profile.js';
 import { detectInstallKind, normalizeProfile } from './profile.js';
 import { manualCommand, type HostRegistryPlan } from './registry.js';
 import { isNewerVersion, parseSemver } from './semver.js';
+import type { UpdateStateStore } from './update-state.js';
 
 export type { Logger, PluginMeta } from './latest.js';
 export type { InstallKind, ProfileLike } from './profile.js';
 export type { HostRegistryPlan } from './registry.js';
+export type { UpdateState, UpdateStateStore, UpdateStateStoreOptions } from './update-state.js';
+export { createUpdateStateStore } from './update-state.js';
 
 export type UpdateErrorCode =
   | 'NO_MANAGER'
@@ -55,9 +59,25 @@ export class PluginUpdateError extends Error {
 
 export interface UpdateView {
   packageName: string;
+  /**
+   * 「当前已安装」的版本 —— **磁盘上 package.json 的版本**，每次 check 现读。
+   *
+   * 这是「是否落后」的**唯一真相**：一键更新把新版写到磁盘后、进程还没重启时，磁盘已经是新版，
+   * 这里就必须反映新版，而不是进程启动时加载的旧代码版本（`runtimeVersion`）。用启动快照判
+   * 「有新版本」是历史 bug 根源：更新完不重启会一直谎报有新版本、并允许重复卸载重装同一版本。
+   */
   currentVersion: string;
+  /** 本进程加载的代码版本（`meta.version`）。仅用于推导 `restartRequired`，不参与「是否落后」判定。 */
+  runtimeVersion: string;
   latestVersion: string | null;
+  /** 磁盘版本落后于 latest 才为真（基于 `currentVersion`，不是 `runtimeVersion`）。 */
   updateAvailable: boolean;
+  /**
+   * 磁盘已是 latest、但本进程加载的仍是旧代码 → 需完全退出 DSH 重启才生效。
+   * 由事实推导（`currentVersion === latestVersion && runtimeVersion !== latestVersion`），
+   * 不依赖易失的内存变量，因此重启前后、点不点按钮、走不走一键都一致。
+   */
+  restartRequired: boolean;
   /** 查询失败（网络 / registry 都不可用），不等于「已是最新」。 */
   checkFailed: boolean;
   canApply: boolean;
@@ -93,6 +113,16 @@ export interface UpdaterDeps {
   /** 可选：注入宿主原生 `registryPlan`（dsh-plugin-manager/registry），让查版本的 registry 顺序与安装一致。 */
   registryPlan?: HostRegistryPlan;
   readFile?: (path: string) => Promise<string>;
+  /**
+   * 读「磁盘已安装版本」（每次现读，不缓存）。默认：`meta.pkgUrl` 存在则读它，否则回退 `meta.version`。
+   * 这是「是否落后」的唯一真相来源；测试可注入固定值。
+   */
+  readInstalledVersion?: () => string;
+  /**
+   * 可选：持久化收敛状态（跨重启的 `lastSeenVersion` / `pendingVersion`）。
+   * 由 `createUpdateStateStore` 提供；不传则不持久化，仅靠磁盘版本判定。
+   */
+  stateStore?: UpdateStateStore;
   logger?: Logger;
   now?: () => number;
   cacheTtlMs?: number;
@@ -158,6 +188,23 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
   let lastView: UpdateView | null = null;
   let applying = false;
 
+  /** 读磁盘已安装版本：注入优先 → meta.pkgUrl → 回退 meta.version。读失败/空串一律回退。 */
+  function installedVersion(): string {
+    if (typeof deps.readInstalledVersion === 'function') {
+      try {
+        const value = deps.readInstalledVersion();
+        if (typeof value === 'string' && value.trim() !== '') return value.trim();
+      } catch {
+        /* 注入实现抛错：走下面的默认链 */
+      }
+    }
+    if (deps.meta.pkgUrl !== undefined) {
+      const value = readInstalledVersion({ pkgUrl: deps.meta.pkgUrl });
+      if (value !== '') return value;
+    }
+    return deps.meta.version;
+  }
+
   function manager(): PluginManagerLike | null {
     try {
       const value = deps.getPluginManager?.();
@@ -198,11 +245,18 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
       ...(deps.readFile === undefined ? {} : { readFile: deps.readFile }),
     });
     const latest = await resolver.latest(options.fresh === true ? { fresh: true } : {});
+    const installed = installedVersion();
+    const runtime = deps.meta.version;
+    // 「已装新版、待重启」：磁盘是 latest，但进程加载的仍是旧代码。
+    const pendingRestart =
+      latest !== null && installed === latest && runtime !== latest;
     const view: UpdateView = {
       packageName: deps.meta.name,
-      currentVersion: deps.meta.version,
+      currentVersion: installed,
+      runtimeVersion: runtime,
       latestVersion: latest,
-      updateAvailable: latest !== null && isNewerVersion(deps.meta.version, latest),
+      updateAvailable: latest !== null && isNewerVersion(installed, latest),
+      restartRequired: pendingRestart,
       checkFailed: latest === null,
       canApply: canApplyWith(install.kind),
       installKind: install.kind,
@@ -214,8 +268,10 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     lastView = view;
     logger('plugin.update.check', {
       current: view.currentVersion,
+      runtime: view.runtimeVersion,
       latest: view.latestVersion,
       updateAvailable: view.updateAvailable,
+      restartRequired: view.restartRequired,
       checkFailed: view.checkFailed,
       canApply: view.canApply,
       installKind: view.installKind,
@@ -239,8 +295,8 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
         target,
       });
     }
-    if (!view.updateAvailable || !isNewerVersion(deps.meta.version, target)) {
-      throw new PluginUpdateError('NO_UPDATE', `当前 v${deps.meta.version} 已是最新（registry: ${target}）`);
+    if (!view.updateAvailable || !isNewerVersion(view.currentVersion, target)) {
+      throw new PluginUpdateError('NO_UPDATE', `当前已安装 v${view.currentVersion} 已是最新（registry: ${target}）`);
     }
     if (parseSemver(target) === undefined) {
       throw new PluginUpdateError('INVALID_VERSION', `registry 返回的版本不是合法 semver：${target}`);
@@ -320,6 +376,14 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
         installKind: install.kind,
         steps,
       };
+      // 持久化「已装待重启」记号（跨重启的展示收敛，防重复提示）。写失败不阻塞更新。
+      if (deps.stateStore !== undefined) {
+        try {
+          deps.stateStore.recordApplied(view.currentVersion, target);
+        } catch {
+          /* 尽力而为 */
+        }
+      }
       logger('plugin.update.apply', { ...result });
       return result;
     } catch (error) {

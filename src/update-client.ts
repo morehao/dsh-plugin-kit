@@ -15,8 +15,22 @@ export type UpdateClientStatus = 'idle' | 'checking' | 'available' | 'current' |
 /** 只保留界面要用的字段，便于测试与跨版本兼容。 */
 export type UpdateClientView = Pick<
   UpdateView,
-  'packageName' | 'currentVersion' | 'latestVersion' | 'updateAvailable' | 'checkFailed' | 'canApply' | 'installKind' | 'manualCommand'
-> & { applying?: boolean; installSpec?: string };
+  | 'packageName'
+  | 'currentVersion'
+  | 'latestVersion'
+  | 'updateAvailable'
+  | 'checkFailed'
+  | 'canApply'
+  | 'installKind'
+  | 'manualCommand'
+> & {
+  applying?: boolean;
+  installSpec?: string;
+  /** 磁盘已是 latest、但需重启生效（由 Host 视图透传）。 */
+  restartRequired?: boolean;
+  /** 本进程加载的代码版本（诊断用，UI 不必须）。 */
+  runtimeVersion?: string;
+};
 
 export interface UpdateClientError {
   code?: string;
@@ -85,8 +99,10 @@ export interface UpdateUiState {
 export function deriveUpdateUiState(state: UpdateClientState): UpdateUiState {
   const { status, view } = state;
   const busy = status === 'checking' || status === 'applying';
-  const settled = status === 'restart-required' || status === 'applied';
-  const updateAvailable = view !== null && view.updateAvailable;
+  // 待重启：本次 apply 返回 restart-required / applied，或 Host 视图直接告出 restartRequired（重启后新进程）。
+  const settled =
+    status === 'restart-required' || status === 'applied' || (view !== null && view.restartRequired === true);
+  const updateAvailable = view !== null && view.updateAvailable && !settled;
   const canApply = view !== null && view.canApply;
   const latestVersion = view === null ? null : view.latestVersion ?? null;
 
@@ -145,7 +161,10 @@ export function updateStatusLabel(state: UpdateClientState): UpdateStatusLabel {
     return { key: 'checking', params: {} };
   }
   if (status === 'applying') return { key: 'applying', params: { version: latest } };
-  if (status === 'restart-required' || status === 'applied') return { key: 'done', params: { version: latest } };
+  if (status === 'restart-required' || status === 'applied' || view.restartRequired === true) {
+    // 待重启的版本号：优先 latest（apply 刚成功的当下），重启后新进程无 latest 时用 currentVersion。
+    return { key: 'done', params: { version: latest !== '' ? latest : current } };
+  }
   if (status === 'failed') {
     // CHECK_FAILED 是检查阶段失败（可重试）；其余（NO_UPDATE / NO_APPLY / apply 失败）算更新失败
     return state.error?.code === 'CHECK_FAILED' ? { key: 'checkFailed', params: {} } : { key: 'failed', params: {} };
@@ -190,6 +209,9 @@ export function createUpdateController(options: UpdateControllerOptions): Update
           error: { code: 'CHECK_FAILED', message: '检查更新失败：拿不到 registry 上的最新版本' },
           checkedAt,
         });
+      } else if (view.restartRequired) {
+        // 磁盘已是 latest、但进程仍是旧代码（如更新后未重启）：落定为「待重启」，不提示有新版。
+        emit({ status: 'restart-required', view, error: null, checkedAt });
       } else {
         emit({ status: view.updateAvailable ? 'available' : 'current', view, error: null, checkedAt });
       }

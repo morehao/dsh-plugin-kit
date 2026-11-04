@@ -26,6 +26,8 @@ export interface PluginMeta {
   name: string;
   version: string;
   repository?: string;
+  /** 本插件 `package.json` 的导入地址；提供后 kit 默认据此每次现读磁盘版本。 */
+  pkgUrl?: URL | string;
 }
 
 export interface LatestDeps {

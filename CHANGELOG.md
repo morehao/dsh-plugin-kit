@@ -1,5 +1,26 @@
 # Changelog
 
+## [v0.5.0] - 2026-11-04
+
+### ⚠️ Breaking（语义变更，三个消费方须同步升级）
+
+- **`UpdateView.currentVersion` 语义改为「磁盘已安装版本」**（此前是进程启动时的 `meta.version` 快照）。
+  `updateAvailable` 改为 `isNewerVersion(currentVersion, latest)`，即基于磁盘判定。这修复了历史 bug：
+  一键更新把新版写入磁盘后、进程未重启时，旧逻辑仍用启动快照判定「落后」，导致一直谎报有新版本、
+  且允许重复卸载重装同一版本。`apply()` 的守卫同样改用磁盘版本，磁盘已最新直接 `NO_UPDATE`。
+- 新增 `UpdateView.runtimeVersion`（本进程加载的代码版本）与 `UpdateView.restartRequired`
+  （`currentVersion === latest && runtimeVersion !== latest` 推导，不再依赖易失内存变量）。
+- 新增 `UpdaterDeps.readInstalledVersion?()`（默认读 `meta.pkgUrl`）与 `meta.pkgUrl`。
+
+### Features
+
+- 新增 `./update` 导出的 `createUpdateStateStore`：跨重启的「已装待重启」持久化（`lastSeenVersion` /
+  `pendingVersion`），内含「prevLastSeen 不回退」防重复提示逻辑（下沉自 `dsh-commands` 的成熟实现）。
+  `UpdaterDeps.stateStore` 注入后，`apply()` 成功写入 `pendingVersion`。
+- `./update/client`：`UpdateClientView` 增加 `restartRequired?` / `runtimeVersion?`；`check()` 在
+  `view.restartRequired` 为真时进入 `restart-required`（重启后新进程也能显示待重启）；
+  `deriveUpdateUiState` 将其视为 settled；`updateStatusLabel` 的 `done` 参数支持无 latest 回退 currentVersion。
+
 ## [v0.4.2] - 2026-11-04
 
 ### Features

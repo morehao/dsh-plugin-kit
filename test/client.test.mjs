@@ -174,3 +174,31 @@ test('updateStatusLabel：CHECK_FAILED → checkFailed，其他 failed → faile
     { key: 'failed', params: {} },
   );
 });
+
+test('check：view.restartRequired → status restart-required（重启后新进程也能显示待重启）', async () => {
+  const controller = createUpdateController({
+    request: request({ check: () => ({ ...VIEW, updateAvailable: false, restartRequired: true }) }),
+  });
+  await controller.check();
+  assert.equal(controller.getState().status, 'restart-required');
+  const ui = deriveUpdateUiState(controller.getState());
+  assert.equal(ui.visual, 'ok-flash');
+  assert.equal(ui.actionable, false);
+});
+
+test('deriveUpdateUiState：view.restartRequired 时即使 updateAvailable 为真也落定为待重启', () => {
+  const ui = deriveUpdateUiState({ status: 'available', view: { ...VIEW, updateAvailable: true, restartRequired: true }, error: null });
+  assert.equal(ui.settled, true);
+  assert.equal(ui.actionable, false);
+  assert.equal(ui.showBadge, false);
+  assert.equal(ui.visual, 'ok-flash');
+});
+
+test('updateStatusLabel：view.restartRequired 无 latest 时用 currentVersion', () => {
+  const label = updateStatusLabel({
+    status: 'restart-required',
+    view: { ...VIEW, latestVersion: null, currentVersion: '0.4.0', updateAvailable: false, restartRequired: true },
+    error: null,
+  });
+  assert.deepEqual(label, { key: 'done', params: { version: '0.4.0' } });
+});
