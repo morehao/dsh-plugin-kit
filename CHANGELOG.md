@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- 新增 `./test` 测试辅助：`createUndeclaredContext()`（Proxy 模拟 cordis「读未声明属性即抛 `cannot get property ... without inject`」）、`createAbsentContext()`（服务未挂载读返回 undefined）、`applyWithoutThrowing()`。供各插件断言 `apply()` 在服务缺失/未声明时降级而不抛，免各写一份守卫 Proxy。纯 headless、不 import node 内建、不引 React。
+
+### Tests
+
+- 新增 packed-exports 冒烟（`npm run check:packed`，并入 `check`）：`npm pack` → 解包 → 遍历 `exports` 每个子路径，断言 `default` 目标可 `import`、`types` 目标存在。兜住「构建成功但 tarball 缺文件/入口指向错」的 `files`/`exports` 白名单事故。
+
 ## [v0.4.0] - 2026-11-02
 
 ### Features
