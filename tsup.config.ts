@@ -12,6 +12,7 @@ export default defineConfig({
     state: 'src/state.ts',
     github: 'src/github.ts',
     meta: 'src/meta.ts',
+    test: 'src/test.ts',
   },
   format: ['esm'],
   target: 'node22',

@@ -11,6 +11,7 @@ DeepSeek Harness（dsh）插件共用的工具包。当前提供这些能力：
 - **JSON 状态持久化**（`./state`）：`$DSH_HOME` 解析 + `<home>/<plugin>/*.json` 读写（读 fail-open、写抛错）。
 - **GitHub 工具**（`./github`）：仓库地址规范化 + Release 正文读取（带 TTL 缓存）。
 - **插件身份**（`./meta`）：从自家 `package.json` 读 name / version / repository。
+- **测试辅助**（`./test`）：`createUndeclaredContext()` / `createAbsentContext()` / `applyWithoutThrowing()`——模拟 cordis 上下文，供各插件断言 `apply()` 在服务缺失/未声明时降级而不抛（免各写一份 Proxy）。仅测试用，不进运行时主链。
 
 设计约束：**零 `@deepseek-ai/*` 运行时依赖**，宿主能力（`pluginManager` / `profileContext`）全部由调用方注入。进程策略由调用方把握：`./update` 常驻能力不主动 spawn，需要 `pnpm view` 时由调用方注入 `runPnpmView`；也可直接用 `./exec`（或 `createPnpmViewRunner`，默认走 `./exec`、可注入 `exec` 替换进程策略）。
 
@@ -268,6 +269,7 @@ readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新�
 | 直连 GitHub API 的**客户端** reader | **不进** | 与 host `./github` 的 `createReleaseReader` 重复；token/限流是插件自己的事，用注入取数即可 |
 | host 引擎的 `appliedVersion` 收敛（跨版本自更新后不再谎报「有新版本」） | **应进（改 `./update`）** | 引擎级行为，与 UI 无关，任何自更新插件都需要 |
 | 更新**胶囊 / 两段确认 / 详情弹窗**等 UI 组件 | **不进（永不）** | 违反判据 2：各插件 `h()`、样式变量、文案体系不同，强行上提会造兼容多主题的巨型组件 |
+| `apply()` 裸 ctx 守卫的**测试辅助**（`createUndeclaredContext` / `createAbsentContext`） | **已进**（`./test`） | 三插件都要断言「读未声明服务不抛」，共用一份 Proxy；headless、零宿主依赖 |
 
 ### 工程铁律：依赖方向单向、消灭重复
 
@@ -278,12 +280,14 @@ readInstalledVersion({ pkgUrl }); // 每次重读（更新后同进程读到新�
 ## 版本与兼容
 
 - Node `^22.20.0 || >=24.0.0`，纯 ESM。
-- `./update`、`./http`、`./exec`、`./fs`、`./state`、`./github`、`./meta` 走 host 侧；`./update/client`、`./update/restore` 只含纯逻辑，不 import node 内置模块、不引 React（客户端产物只允许 react）。
+- `./update`、`./http`、`./exec`、`./fs`、`./state`、`./github`、`./meta` 走 host 侧；`./update/client`、`./update/restore` 只含纯逻辑，不 import node 内置模块、不引 React（客户端产物只允许 react）。`./test` 是测试辅助，纯 headless，host / 客户端测试均可用。
 - 宿主服务形状按结构化类型处理（`PluginManagerLike` / `ProfileLike`），宿主版本变化不会把插件一起拖下去。
 
 ## 开发
 
 ```bash
 npm install
-npm run check   # typecheck + build + 78 条离线测试（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
+npm run check   # typecheck + build + 离线测试 + packed-exports 冒烟（假 fetch / 假 pluginManager / 假 exec，不联网、不真装）
 ```
+
+`npm run check:packed` 单独跑 packed-exports 冒烟：`npm pack` → 解包 → 遍历 `exports` 每个子路径，断言 `default` 目标能 `import`、`types` 目标存在——专门兜住「tsup 构建成功、但 tarball 里缺文件/入口指向错」这类 `files`/`exports` 白名单事故。
