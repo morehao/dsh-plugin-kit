@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.5.1] - 2026-11-05
+
+### Features
+
+- `check()` 优先复用宿主 0.2.2 的 `pluginManager.listVersions(name)`：逐版本带 `engines.dsh` / DSH peers 兼容性；自动跳过 incompatible，只选「兼容 + 稳定（或 dist-tag=latest）」，不自动推 prerelease。`UpdateView.versions` / `versionsOmitted` 暴露给 UI，用于解释「最新版为什么没被选中」。
+- `apply()` 优先复用宿主 `pluginManager.updateBundle(name, version)`：目标校验、移除、安装、失败自动恢复全由宿主完成；`ROLLBACK_FAILED` / `INCOMPATIBLE_VERSION` / `UNSUPPORTED_PLATFORM` 为新映射的稳定错误码。`apply({ version })` 可从 `view.versions` 里选任意兼容版本。
+- 新增 `HostVersionListing` / `HostVersionOption` 类型导出（`./update`）。
+
+### Compatibility
+
+- 旧宿主（无 `listVersions` / `updateBundle`）完整回退到原有 `pnpm view` / registry `/latest` + `installBundle → already-installed → removeBundle → installBundle` 路径，行为不变。
+- `link:` / `file:` / `workspace:` 安装仍只给手动命令；`updateBundle` 的 `not-updatable` 也会回退。
+
 ## [v0.5.0] - 2026-11-04
 
 ### ⚠️ Breaking（语义变更，三个消费方须同步升级）

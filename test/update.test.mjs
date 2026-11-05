@@ -338,3 +338,127 @@ test('pnpmView runner：无 profile.dir / 命令失败 / 非法版本 → null',
   const throwing = createPnpmViewRunner({ getProfile: () => { throw new Error('no ctx'); }, exec: fakeExec(() => ({ code: 0 })) });
   assert.equal(await throwing('@demo/plugin@latest'), null);
 });
+
+// ── 0.2.2+：宿主 listVersions / updateBundle ─────────────────────────
+
+function fakeVersionManager(handlers = {}) {
+  const calls = [];
+  return {
+    calls,
+    ...(handlers.listVersions === undefined ? {} : {
+      async listVersions(name) {
+        calls.push(['listVersions', name]);
+        return handlers.listVersions(name, calls);
+      },
+    }),
+    ...(handlers.updateBundle === undefined ? {} : {
+      async updateBundle(name, version, options) {
+        calls.push(['updateBundle', name, version, options]);
+        return handlers.updateBundle(name, version, options, calls);
+      },
+    }),
+    ...(handlers.installBundle === undefined ? {} : { installBundle: handlers.installBundle }),
+  };
+}
+
+function listed(versions, extra = {}) {
+  return {
+    status: 'listed',
+    installed: '0.3.0',
+    registry: 'https://registry.npmjs.org/',
+    versions,
+    omitted: 0,
+    ...extra,
+  };
+}
+
+test('listVersions：跳过 incompatible，选兼容稳定版；view.versions 保留原因', async () => {
+  const manager = fakeVersionManager({
+    listVersions: () => listed([
+      { version: '0.5.0', tags: ['latest'], prerelease: false, incompatible: { requirements: { 'engines.dsh': '>=0.3.0' } } },
+      { version: '0.4.0', tags: [], prerelease: false },
+    ]),
+    updateBundle: () => ({ step: 'install', result: { application: 'restart-required' } }),
+  });
+  const instance = updater({ manager });
+  const view = await instance.check();
+  assert.equal(view.latestVersion, '0.4.0', '最新版不兼容时退到次新兼容版');
+  assert.equal(view.updateAvailable, true);
+  assert.equal(view.checkFailed, false);
+  assert.equal(view.versions.length, 2);
+  assert.match(view.versions[0].incompatible, /engines\.dsh/);
+  assert.equal(view.versions[1].incompatible, undefined);
+
+  const result = await instance.apply();
+  assert.equal(result.application, 'restart-required');
+  assert.equal(result.updatedVersion, '0.4.0');
+  assert.deepEqual(manager.calls.filter((call) => call[0] === 'updateBundle'), [
+    ['updateBundle', '@demo/plugin', '0.4.0', undefined],
+  ]);
+});
+
+test('listVersions：没有可更新版本 → 已是最新，不算查询失败', async () => {
+  const manager = fakeVersionManager({ listVersions: () => listed([]) });
+  const instance = updater({ manager, fetchImpl: async () => { throw new Error('should not be asked'); } });
+  const view = await instance.check();
+  assert.equal(view.latestVersion, '0.3.0');
+  assert.equal(view.updateAvailable, false);
+  assert.equal(view.checkFailed, false);
+  assert.deepEqual(view.versions, []);
+});
+
+test('listVersions：refused / 抛错 → 回退 pnpm / registry', async () => {
+  const refused = fakeVersionManager({ listVersions: () => ({ status: 'refused', problem: 'not-updatable', reason: 'link install' }) });
+  const a = updater({ manager: refused });
+  assert.equal((await a.check()).latestVersion, '0.4.0');
+
+  const throwing = fakeVersionManager({ listVersions: () => { throw new Error('host down'); } });
+  const b = updater({ manager: throwing });
+  assert.equal((await b.check()).latestVersion, '0.4.0');
+});
+
+test('updateBundle：不支持平台 / 不兼容 / 恢复失败分别映射', async () => {
+  const platform = fakeVersionManager({
+    listVersions: () => listed([{ version: '0.4.0', tags: ['latest'], prerelease: false }]),
+    updateBundle: () => ({ step: 'check', result: { error: { code: 'unsupported-platform', message: 'darwin only' } } }),
+  });
+  const a = updater({ manager: platform });
+  await a.check();
+  await assert.rejects(a.apply(), (error) => error.code === 'UNSUPPORTED_PLATFORM');
+
+  const incompatible = fakeVersionManager({
+    listVersions: () => listed([{ version: '0.4.0', tags: ['latest'], prerelease: false }]),
+    updateBundle: () => ({ step: 'check', result: { error: { code: 'incompatible-version', message: 'needs newer dsh' } } }),
+  });
+  const b = updater({ manager: incompatible });
+  await b.check();
+  await assert.rejects(b.apply(), (error) => error.code === 'INCOMPATIBLE_VERSION');
+
+  const rollback = fakeVersionManager({
+    listVersions: () => listed([{ version: '0.4.0', tags: ['latest'], prerelease: false }]),
+    updateBundle: () => ({
+      step: 'install',
+      result: { error: { code: 'operation-error', message: 'disk full' } },
+      restore: { error: { code: 'operation-error', message: 'restore failed' } },
+    }),
+  });
+  const c = updater({ manager: rollback });
+  await c.check();
+  await assert.rejects(c.apply(), (error) => error.code === 'ROLLBACK_FAILED');
+});
+
+test('updateBundle：apply({version}) 只能选列表里的兼容版本', async () => {
+  const manager = fakeVersionManager({
+    listVersions: () => listed([
+      { version: '0.5.0', tags: ['latest'], prerelease: false },
+      { version: '0.4.0', tags: [], prerelease: false },
+    ]),
+    updateBundle: (name, version) => ({ step: 'install', result: { application: 'applied', version } }),
+  });
+  const instance = updater({ manager });
+  await instance.check();
+  const result = await instance.apply({ version: '0.4.0' });
+  assert.equal(result.updatedVersion, '0.4.0');
+  assert.deepEqual(manager.calls.at(-1).slice(0, 3), ['updateBundle', '@demo/plugin', '0.4.0']);
+  await assert.rejects(instance.apply({ version: '9.9.9' }), (error) => error.code === 'INVALID_VERSION');
+});
