@@ -26,11 +26,13 @@ import { detectInstallKind, normalizeProfile } from './profile.js';
 import { manualCommand, type HostRegistryPlan } from './registry.js';
 import { isNewerVersion, parseSemver } from './semver.js';
 import type { UpdateStateStore } from './update-state.js';
+import { createVersionLister, type HostVersionOption, type VersionLister } from './versions.js';
 
 export type { Logger, PluginMeta } from './latest.js';
 export type { InstallKind, ProfileLike } from './profile.js';
 export type { HostRegistryPlan } from './registry.js';
 export type { UpdateState, UpdateStateStore, UpdateStateStoreOptions } from './update-state.js';
+export type { HostVersionListing, HostVersionOption } from './versions.js';
 export { createUpdateStateStore } from './update-state.js';
 
 export type UpdateErrorCode =
@@ -43,6 +45,8 @@ export type UpdateErrorCode =
   | 'INSTALL_FAILED'
   | 'REMOVE_FAILED'
   | 'ROLLBACK_FAILED'
+  | 'INCOMPATIBLE_VERSION'
+  | 'UNSUPPORTED_PLATFORM'
   | 'UNSUPPORTED_RESULT';
 
 export class PluginUpdateError extends Error {
@@ -86,6 +90,22 @@ export interface UpdateView {
   manualCommand: string;
   applying: boolean;
   checkedAt?: string;
+  /**
+   * 宿主 `listVersions` 给出的新版本（新到旧）；旧宿主没有该字段。
+   * `incompatible` 有值表示当前 DSH 装不了；UI 可据此解释「为什么最新版没被选中」。
+   */
+  versions?: UpdateVersionOption[];
+  /** 被宿主列表上限省略的更新版本数。 */
+  versionsOmitted?: number;
+}
+
+/** UI 可消费的版本项（宿主 `HostVersionOption` 的收敛形状）。 */
+export interface UpdateVersionOption {
+  version: string;
+  prerelease: boolean;
+  deprecated?: string;
+  /** 当前 DSH 无法安装的原因；absent = 兼容。 */
+  incompatible?: string;
 }
 
 export interface ApplyResult {
@@ -101,6 +121,10 @@ export interface PluginManagerLike {
   installBundle?: (spec: string) => Promise<unknown>;
   removeBundle?: (name: string) => Promise<unknown>;
   registries?: () => unknown;
+  /** 0.2.2+：列出比已装版本新的版本，并带兼容性。 */
+  listVersions?: (name: string) => Promise<unknown>;
+  /** 0.2.2+：宿主原生更新（校验目标 → 移除 → 安装 → 失败自动恢复）。 */
+  updateBundle?: (name: string, version: string, options?: { requestId?: string }) => Promise<unknown>;
 }
 
 export interface UpdaterDeps {
@@ -169,6 +193,75 @@ function failureMessage(error: UnwrappedResult['error']): string {
   return '';
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 去掉 `{ok,value|error}` 包装；非对象返回 null。 */
+function unwrapEnvelope(result: unknown): Record<string, unknown> | null {
+  if (!isRecord(result)) return null;
+  if (typeof result.ok === 'boolean' && !('application' in result) && !('step' in result) && ('value' in result || 'error' in result)) {
+    if (!result.ok) return { error: result.error };
+    return unwrapEnvelope(result.value);
+  }
+  return result;
+}
+
+interface HostUpdateOutcome {
+  step?: unknown;
+  application?: unknown;
+  error?: UnwrappedResult['error'];
+  version?: unknown;
+  restoreError?: UnwrappedResult['error'];
+}
+
+/**
+ * 读宿主 `updateBundle` 的结果：`{ step, result: ChangeResult, restore? }`。
+ * 兼容远程 `{ok, value|error}` 包装；`result` 缺失时按扁平结果读。
+ */
+function readUpdateOutcome(result: unknown): HostUpdateOutcome {
+  const outer = unwrapEnvelope(result);
+  if (outer === null) return {};
+  const inner = isRecord(outer.result) ? outer.result : outer;
+  const restore = isRecord(outer.restore) ? outer.restore : undefined;
+  return {
+    ...(typeof outer.step === 'string' ? { step: outer.step } : {}),
+    ...(inner.application !== undefined ? { application: inner.application } : {}),
+    ...(inner.error !== undefined && inner.error !== null ? { error: asError(inner.error) } : {}),
+    ...(inner.version !== undefined ? { version: inner.version } : {}),
+    ...(restore?.error !== undefined && restore.error !== null ? { restoreError: asError(restore.error) } : {}),
+  };
+}
+
+/** 把宿主 `updateBundle` 的错误码映射成 kit 的稳定错误码。 */
+function mapHostUpdateError(error: UnwrappedResult['error'], step: unknown): UpdateErrorCode {
+  const code = typeof error?.code === 'string' ? error.code : '';
+  if (code === 'incompatible-version') return 'INCOMPATIBLE_VERSION';
+  if (code === 'unsupported-platform') return 'UNSUPPORTED_PLATFORM';
+  if (step === 'remove') return 'REMOVE_FAILED';
+  return 'INSTALL_FAILED';
+}
+
+/** 把宿主给出的不兼容信息压成一段可展示文本。 */
+function describeIncompatible(value: unknown): string {
+  if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  if (!isRecord(value)) return 'incompatible with the running DSH';
+  if (isRecord(value.requirements)) {
+    const parts = Object.entries(value.requirements)
+      .map(([name, range]) => `${name} ${String(range)}`)
+      .join(', ');
+    if (parts !== '') return parts;
+  }
+  if (typeof value.name === 'string') {
+    return typeof value.version === 'string' ? `${value.name} ${value.version}` : value.name;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return 'incompatible with the running DSH';
+  }
+}
+
 const APPLICATIONS = new Set(['applied', 'restart-required', 'overridden']);
 
 export function createPluginUpdater(deps: UpdaterDeps): Updater {
@@ -183,6 +276,13 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     ...(deps.now === undefined ? {} : { now: deps.now }),
     ...(deps.cacheTtlMs === undefined ? {} : { cacheTtlMs: deps.cacheTtlMs }),
     ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
+    logger,
+  });
+  const versionLister: VersionLister = createVersionLister({
+    meta: deps.meta,
+    ...(deps.getPluginManager === undefined ? {} : { getPluginManager: deps.getPluginManager }),
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+    ...(deps.cacheTtlMs === undefined ? {} : { cacheTtlMs: deps.cacheTtlMs }),
     logger,
   });
   let lastView: UpdateView | null = null;
@@ -234,18 +334,64 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
 
   function canApplyWith(kind: InstallKind): boolean {
     const service = manager();
-    if (service === null || typeof service.installBundle !== 'function') return false;
-    return kind === 'registry' || kind === 'unknown';
+    if (service === null) return false;
+    // 0.2.2+ 的 updateBundle 可以单独完成更新；旧宿主只有 installBundle。
+    const canChange = typeof service.installBundle === 'function' || typeof service.updateBundle === 'function';
+    return canChange && (kind === 'registry' || kind === 'unknown');
+  }
+
+  /** 从宿主列表里挑「可自动更新」的目标：兼容、稳定（或 dist-tag=latest）；不自动推 prerelease。 */
+  function pickLatest(versions: readonly HostVersionOption[]): string | null {
+    const compatible = versions.filter(option => option.incompatible === undefined);
+    const stable = compatible.find(option => option.tags.includes('latest') || !option.prerelease);
+    return stable?.version ?? null;
+  }
+
+  /** 把宿主版本项收敛成客户端可读的形状。 */
+  function toVersionOption(option: HostVersionOption): UpdateVersionOption {
+    return {
+      version: option.version,
+      prerelease: option.prerelease,
+      ...(option.deprecated === undefined ? {} : { deprecated: option.deprecated }),
+      ...(option.incompatible === undefined ? {} : { incompatible: describeIncompatible(option.incompatible) }),
+    };
+  }
+
+  /** 收尾：持久化「已装待重启」记号 + 固定成功事件。写失败不阻塞更新。 */
+  function finish(view: UpdateView, result: ApplyResult): ApplyResult {
+    if (deps.stateStore !== undefined) {
+      try {
+        deps.stateStore.recordApplied(view.currentVersion, result.updatedVersion);
+      } catch {
+        /* 尽力而为 */
+      }
+    }
+    logger('plugin.update.apply', { ...result });
+    return result;
   }
 
   async function check(options: { fresh?: boolean } = {}): Promise<UpdateView> {
+    const installed = installedVersion();
     const install = await detectInstallKind({
       profile: profile(),
       packageName: deps.meta.name,
       ...(deps.readFile === undefined ? {} : { readFile: deps.readFile }),
     });
-    const latest = await resolver.latest(options.fresh === true ? { fresh: true } : {});
-    const installed = installedVersion();
+
+    // 0.2.2+：优先问宿主 listVersions；旧宿主 / 非 registry 安装 / 查询失败都回退。
+    const listing = await versionLister.list(options.fresh === true ? { fresh: true } : {});
+    let latest: string | null;
+    let versions: UpdateVersionOption[] | undefined;
+    let versionsOmitted: number | undefined;
+    if (listing?.status === 'listed') {
+      versions = listing.versions.map(toVersionOption);
+      versionsOmitted = listing.omitted;
+      // 没有可自动更新的稳定版本时取已装版本，语义是「没有可用更新」而不是「查询失败」。
+      latest = pickLatest(listing.versions) ?? installed;
+    } else {
+      latest = await resolver.latest(options.fresh === true ? { fresh: true } : {});
+    }
+
     const runtime = deps.meta.version;
     // 「已装新版、待重启」：磁盘是 latest，但进程加载的仍是旧代码。
     const pendingRestart =
@@ -264,6 +410,8 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
       manualCommand: manualCommand(deps.meta.name, profileName()),
       applying,
       checkedAt: new Date(now()).toISOString(),
+      ...(versions === undefined ? {} : { versions }),
+      ...(versionsOmitted === undefined ? {} : { versionsOmitted }),
     };
     lastView = view;
     logger('plugin.update.check', {
@@ -275,6 +423,7 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
       checkFailed: view.checkFailed,
       canApply: view.canApply,
       installKind: view.installKind,
+      ...(versions === undefined ? {} : { versions: versions.length }),
     });
     return view;
   }
@@ -290,16 +439,21 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
     }
     const target = view.latestVersion;
     if (options.version !== undefined && options.version !== target) {
-      throw new PluginUpdateError('INVALID_VERSION', `只能更新到刚查到的 ${target}，不接受 ${options.version}`, {
-        requested: options.version,
-        target,
-      });
+      // 有宿主版本列表时允许选其中任意一个兼容版本；旧宿主仍只接受刚查到的 target。
+      const listed = view.versions?.some(option => option.version === options.version && option.incompatible === undefined);
+      if (listed !== true) {
+        throw new PluginUpdateError('INVALID_VERSION', `只能更新到刚查到的 ${target}，不接受 ${options.version}`, {
+          requested: options.version,
+          target,
+        });
+      }
     }
-    if (!view.updateAvailable || !isNewerVersion(view.currentVersion, target)) {
+    const chosen = options.version ?? target;
+    if (!view.updateAvailable || !isNewerVersion(view.currentVersion, chosen)) {
       throw new PluginUpdateError('NO_UPDATE', `当前已安装 v${view.currentVersion} 已是最新（registry: ${target}）`);
     }
-    if (parseSemver(target) === undefined) {
-      throw new PluginUpdateError('INVALID_VERSION', `registry 返回的版本不是合法 semver：${target}`);
+    if (parseSemver(chosen) === undefined) {
+      throw new PluginUpdateError('INVALID_VERSION', `目标版本不是合法 semver：${chosen}`);
     }
     const install = await detectInstallKind({
       profile: profile(),
@@ -314,22 +468,54 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
       );
     }
     const service = manager();
-    if (service === null || typeof service.installBundle !== 'function') {
+    const useUpdateBundle = service !== null
+      && typeof service.updateBundle === 'function'
+      && (install.kind === 'registry' || install.kind === 'unknown');
+    if (!useUpdateBundle && (service === null || typeof service.installBundle !== 'function')) {
       // 注意：这不是「宿主缺失」——本包定位就是 DSH 插件，宿主必然在。
-      // 而是「当前部署未向本插件暴露 installBundle 能力」（pluginManager 是可选/远程服务），
+      // 而是「当前部署未向本插件暴露 installBundle / updateBundle 能力」（pluginManager 是可选/远程服务），
       // 或该服务尚未就绪。此时退回手动命令，界面照常可用。
-      throw new PluginUpdateError('NO_MANAGER', '当前 profile 未提供一键安装能力（pluginManager.installBundle 不可用），请手动更新', {
+      throw new PluginUpdateError('NO_MANAGER', '当前 profile 未提供一键安装能力（pluginManager.installBundle / updateBundle 不可用），请手动更新', {
         manualCommand: view.manualCommand,
       });
     }
-    const installBundle = service.installBundle.bind(service);
-    const removeBundle = typeof service.removeBundle === 'function' ? service.removeBundle.bind(service) : null;
-    const spec = `${deps.meta.name}@${target}`;
+    const installBundle = typeof service?.installBundle === 'function' ? service.installBundle.bind(service) : null;
+    const removeBundle = service !== null && typeof service.removeBundle === 'function' ? service.removeBundle.bind(service) : null;
+    const spec = `${deps.meta.name}@${chosen}`;
     const steps: string[] = [];
     applying = true;
     lastView = { ...view, applying: true };
-    logger('plugin.update.apply.start', { from: deps.meta.version, target, installKind: install.kind });
+    logger('plugin.update.apply.start', { from: deps.meta.version, target: chosen, installKind: install.kind });
     try {
+      if (useUpdateBundle) {
+        steps.push(`update ${deps.meta.name}@${chosen}`);
+        const outcome = readUpdateOutcome(await service!.updateBundle!(deps.meta.name, chosen));
+        // 更新失败且宿主恢复旧版本也失败：先把「回滚失败」报出来，避免误以为还能用。
+        if (outcome.restoreError !== undefined) {
+          throw new PluginUpdateError('ROLLBACK_FAILED', `更新失败且恢复旧版本失败：${failureMessage(outcome.restoreError)}`, { steps });
+        }
+        if (outcome.error !== undefined) {
+          throw new PluginUpdateError(
+            mapHostUpdateError(outcome.error, outcome.step),
+            failureMessage(outcome.error) || `更新到 v${chosen} 失败`,
+            { steps, hostCode: outcome.error.code },
+          );
+        }
+        const application = typeof outcome.application === 'string' ? outcome.application : 'unknown';
+        if (!APPLICATIONS.has(application)) {
+          throw new PluginUpdateError('UNSUPPORTED_RESULT', `更新未生效（application=${application}）`, { steps });
+        }
+        return finish(view, {
+          application: application as ApplyResult['application'],
+          restartRequired: application !== 'applied',
+          updatedVersion: typeof outcome.version === 'string' ? outcome.version : chosen,
+          installKind: install.kind,
+          steps,
+        });
+      }
+      if (installBundle === null) {
+        throw new PluginUpdateError('NO_MANAGER', '当前 profile 未提供一键安装能力，请手动更新', { manualCommand: view.manualCommand });
+      }
       steps.push(`install ${spec}`);
       let installed = unwrapResult(await installBundle(spec));
       let removed = false;
@@ -363,29 +549,19 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
             });
           }
         }
-        throw new PluginUpdateError('INSTALL_FAILED', `安装 v${target} 失败：${message}`, { steps });
+        throw new PluginUpdateError('INSTALL_FAILED', `安装 v${chosen} 失败：${message}`, { steps });
       }
       const application = typeof installed.application === 'string' ? installed.application : 'unknown';
       if (!APPLICATIONS.has(application)) {
         throw new PluginUpdateError('UNSUPPORTED_RESULT', `更新未生效（application=${application}）`, { steps });
       }
-      const result: ApplyResult = {
+      return finish(view, {
         application: application as ApplyResult['application'],
         restartRequired: application !== 'applied',
-        updatedVersion: target,
+        updatedVersion: chosen,
         installKind: install.kind,
         steps,
-      };
-      // 持久化「已装待重启」记号（跨重启的展示收敛，防重复提示）。写失败不阻塞更新。
-      if (deps.stateStore !== undefined) {
-        try {
-          deps.stateStore.recordApplied(view.currentVersion, target);
-        } catch {
-          /* 尽力而为 */
-        }
-      }
-      logger('plugin.update.apply', { ...result });
-      return result;
+      });
     } catch (error) {
       const normalized =
         error instanceof PluginUpdateError
@@ -402,7 +578,11 @@ export function createPluginUpdater(deps: UpdaterDeps): Updater {
   return {
     check,
     view: () => lastView,
-    latestVersion: (options: { fresh?: boolean } = {}) => resolver.latest(options),
+    latestVersion: async (options: { fresh?: boolean } = {}) => {
+      const listing = await versionLister.list(options);
+      if (listing?.status === 'listed') return pickLatest(listing.versions) ?? installedVersion();
+      return resolver.latest(options);
+    },
     apply,
     isApplying: () => applying,
   };
